@@ -21,6 +21,7 @@
 #include "dc_target_pass.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <vector>
@@ -236,13 +237,41 @@ std::string rewrite_body(const std::string& body, std::set<int>& used_out) {
     int irq_sites = 0;
     static const std::string irq_stmt = "if (psx_check_interrupts_at(cpu, ";
     static const std::string irq_expr = "psx_check_interrupts_at(cpu,";
+    // Block labels already emitted above the current point. A check whose
+    // constant target is not among them is a forward branch: it is dropped,
+    // because every forward path reaches a back-edge, a call, a dispatch or a
+    // return, which still poll. Set PSXRECOMP_DC_IRQ_ALL_BRANCHES=1 to keep
+    // the reference behaviour of polling on every branch.
+    static const bool poll_all = [] {
+        const char* v = std::getenv("PSXRECOMP_DC_IRQ_ALL_BRANCHES");
+        return v && *v && *v != '0';
+    }();
+    std::set<std::string> seen_labels;
     for (size_t i = 0; i < body.size();) {
+        if ((i == 0 || body[i - 1] == '\n') &&
+            (starts_with_at(body, i, "block_") || starts_with_at(body, i, "label_"))) {
+            size_t p = i + 6;
+            while (p < body.size() && std::isxdigit(static_cast<unsigned char>(body[p]))) ++p;
+            if (p == i + 14 && p < body.size() && body[p] == ':') {
+                seen_labels.insert(body.substr(i + 6, 8));
+            }
+        }
         if (body.compare(i, irq_stmt.size(), irq_stmt) == 0) {
             size_t arg = i + irq_stmt.size();
             size_t close = body.find(')', arg);
             size_t lparen = body.find('(', arg);
             if (close != std::string::npos && (lparen == std::string::npos || lparen > close) &&
                 body.compare(close, 10, ")) return;") == 0) {
+                const std::string target = body.substr(arg, close - arg);
+                bool constant = target.size() == 11 && target.compare(0, 2, "0x") == 0 &&
+                                target[10] == 'u';
+                for (size_t k = 2; constant && k < 10; ++k) {
+                    constant = std::isxdigit(static_cast<unsigned char>(target[k])) != 0;
+                }
+                if (!poll_all && constant && !seen_labels.count(target.substr(2, 8))) {
+                    i = close + 10;  // forward branch: no poll
+                    continue;
+                }
                 ++irq_sites;
                 const std::string n = std::to_string(irq_sites);
                 a += "if (__builtin_expect(g_irq_pending, 0)) { _dc_irq_pc = (" +
