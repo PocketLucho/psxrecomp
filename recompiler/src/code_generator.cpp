@@ -4122,8 +4122,15 @@ std::string CodeGenerator::generate_file(
         for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
 
+            std::set<uint32_t> data_starts;
+            for (const auto& f : functions_mut)
+                if (f.is_data_section) data_starts.insert(f.start_addr);
+
             // Scan either all CFGs (pass 0) or only rebuilt CFGs (pass 1+)
             auto scan_cfg = [&](const ControlFlowGraph& cfg) {
+                // A data section is emitted as a dispatch stub; its decoded
+                // "branches" are data words and must not mint entry points.
+                if (config_.split_skip_data_sources && data_starts.count(cfg.function_start)) return;
                 for (const auto& [baddr, block] : cfg.blocks) {
                     auto check_target = [&](uint32_t target) {
                         if (target == 0) return;

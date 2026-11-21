@@ -84,6 +84,7 @@ struct CodeGenConfig {
     bool optimize_zero_reg;       // Optimize away $zero assignments
     bool use_switch_for_blocks;   // Use switch instead of goto labels
     bool split_mid_function_targets; // Split branch targets into funcs for legacy main-EXE analysis
+    bool split_skip_data_sources = false; // Ignore "branches" decoded from data sections when splitting
     // True when compiling an overlay image (psxrecomp-game --overlay). Overlay
     // regions hold different scene VARIANTS at the same addresses (the same addr
     // is backdrop code in one scene, unrelated code/data in another), so an

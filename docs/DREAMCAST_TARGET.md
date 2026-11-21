@@ -49,16 +49,31 @@ Xenogears (USA-serial disc-1 EXE) main executable compiled for SH-4:
 | PC output, no cycle timing | 5.45 MB |
 | `--target dc` (back-edge polling) | 3.34 MB |
 | same + `DC_GUEST_RAM_MMU` | 2.03 MB |
+| `--target dc` (data sections no longer split) | 2.12 MB |
+| same + `DC_GUEST_RAM_MMU` | 1.04 MB |
 
 Interrupt poll sites drop from 17,771 to 2,181.
 
+### Data sections no longer mint entry points
+
+The main-EXE split pre-pass (code_generator.cpp) scans every CFG for branch
+targets outside it and turns them into new functions. That included the CFGs of
+data sections, which are only emitted as dispatch stubs: their words decode as
+random branches, and each one minted a function. In Xenogears that pre-pass
+added 792 entries, most of them translating data as code, and several gap
+functions of one pass all ran to the same next start, so the same bytes were
+emitted up to 24 times (generated C 1.87x the size of its unique blocks).
+
+With `--target dc` the pre-pass skips data-section CFGs
+(`CodeGeneratorConfig::split_skip_data_sources`). Xenogears then adds 15 entries,
+the duplication drops to 1.09x (host + alias body only) and out-of-function
+fallthroughs drop from 537 to 14. Every entry that disappears was reached only
+from a data section; branches and call returns from real code are still split as
+before. The PC output does not change.
+
 ## Still to do
 
-- Function fragmentation. Two causes seen in the benchmark: a JAL target whose
-  prologue is preceded by setup code becomes an 8-byte function plus a separate
-  prologue function, and jump-table case targets become function entries that
-  each span to the end of the switch (duplicating the switch body and routing
-  cases through dispatch). Xenogears shows 537 fallthroughs into the next
-  function and 108 out-of-function branches.
+- Remaining fragmentation: 15 split entries, 14 out-of-function fallthroughs,
+  and alias hosts emitted twice (host body + shared alias body).
 - Drop entry resume switches that nothing can reach.
 - A KallistiOS runtime: dispatch, GTE, CD, GPU translation, SPU→AICA.
