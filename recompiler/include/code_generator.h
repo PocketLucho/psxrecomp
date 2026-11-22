@@ -85,6 +85,9 @@ struct CodeGenConfig {
     bool use_switch_for_blocks;   // Use switch instead of goto labels
     bool split_mid_function_targets; // Split branch targets into funcs for legacy main-EXE analysis
     bool split_skip_data_sources = false; // Ignore "branches" decoded from data sections when splitting
+    bool emit_resume_seed_switch = true;   // Savestate resume switch (g_psx_resume_seed)
+    bool continuations_all_leaders = true; // Register every block leader as a CPS continuation,
+                                           // not only call returns (interrupt-resume escapes)
     // True when compiling an overlay image (psxrecomp-game --overlay). Overlay
     // regions hold different scene VARIANTS at the same addresses (the same addr
     // is backdrop code in one scene, unrelated code/data in another), so an

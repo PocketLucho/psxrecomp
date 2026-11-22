@@ -1684,6 +1684,13 @@ int main(int argc, char** argv) {
     codegen_config.emit_line_numbers = true;
     codegen_config.split_mid_function_targets = !overlay_mode;
     codegen_config.split_skip_data_sources = (output_target == "dc");
+    if (output_target == "dc") {
+        // No savestates on the DC runtime, and dc_irq_slow services interrupts
+        // in place, so only call returns need to be resumable continuations.
+        codegen_config.emit_resume_seed_switch = false;
+        codegen_config.continuations_all_leaders =
+            std::getenv("PSXRECOMP_DC_RESUME_ALL_LEADERS") != nullptr;
+    }
     codegen_config.overlay_mode = overlay_mode;
     codegen_config.ws_signed_x_bound_sites = ws_signed_x_bound_sites;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;

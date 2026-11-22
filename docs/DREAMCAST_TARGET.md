@@ -37,6 +37,7 @@ ordering-table build, LZ decompression):
 | `--target dc`, poll on every branch | 6.4 | 5.1 | 5.2 | 17 |
 | same + `DC_GUEST_RAM_MMU` | 5.5 | 4.5 | 3.9 | 16 |
 | `--target dc` (back-edge polling) + `DC_GUEST_RAM_MMU` | 5.2 | 3.3 | 3.4 | 15 |
+| same, call-return continuations only | 4.9 | 3.2 | 3.1 | 15 |
 | Same C compiled natively for SH-4 | 3.7 | 1.3 | 1.3 | 2.5 |
 
 The LZ case is dominated by function fragmentation (loop blocks emitted as
@@ -51,6 +52,8 @@ Xenogears (USA-serial disc-1 EXE) main executable compiled for SH-4:
 | same + `DC_GUEST_RAM_MMU` | 2.03 MB |
 | `--target dc` (data sections no longer split) | 2.12 MB |
 | same + `DC_GUEST_RAM_MMU` | 1.04 MB |
+| `--target dc` (call-return continuations only) | 1.69 MB |
+| same + `DC_GUEST_RAM_MMU` | 0.65 MB |
 
 Interrupt poll sites drop from 17,771 to 2,181.
 
@@ -71,9 +74,21 @@ fallthroughs drop from 537 to 14. Every entry that disappears was reached only
 from a data section; branches and call returns from real code are still split as
 before. The PC output does not change.
 
+### Entry switches
+
+Every PC function starts with two switches over its block leaders: one for
+savestate resume (`g_psx_resume_seed`) and one for CPS continuations
+(`cpu->pc`), which registers every leader so an interrupt escape can resume at
+any of them. With `--target dc` the savestate switch is not emitted and only
+call returns (the instruction after a `jal`/`jalr` delay slot) are registered as
+continuations. Xenogears goes from 18,505 to 2,983 switch cases.
+
+This sets a contract for the DC runtime: `dc_irq_slow` must service the
+interrupt in place and return 0. A runtime that needs to escape at an interrupt
+poll must generate with `PSXRECOMP_DC_RESUME_ALL_LEADERS=1`.
+
 ## Still to do
 
 - Remaining fragmentation: 15 split entries, 14 out-of-function fallthroughs,
   and alias hosts emitted twice (host body + shared alias body).
-- Drop entry resume switches that nothing can reach.
 - A KallistiOS runtime: dispatch, GTE, CD, GPU translation, SPU→AICA.

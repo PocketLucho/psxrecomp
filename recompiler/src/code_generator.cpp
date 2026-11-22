@@ -3157,7 +3157,7 @@ GeneratedFunction CodeGenerator::generate_function(
     // Register every leader (the jal/jalr call-returns pushed during translation
     // above are a subset, deduped by `seen`/the owner map). Entry block runs from
     // the top (cpu->pc==0) and is dispatched as a function entry, so skip it.
-    if (cps_enabled_) {
+    if (cps_enabled_ && config_.continuations_all_leaders) {
         for (uint32_t block_addr : cfg.block_order) {
             if (block_addr == func.start_addr) continue;
             cps_cur_continuations_.push_back(block_addr);
@@ -3220,24 +3220,26 @@ GeneratedFunction CodeGenerator::generate_function(
         // the snapshot held rather than the ones live at the real resume
         // point -- which could cascade into a wild jump a few iterations
         // later. Every other PC class is unaffected; this is purely additive. */
-        body_ss << config_.indent << "{\n";
-        body_ss << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
-        body_ss << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
-        body_ss << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
-        body_ss << config_.indent << "        g_psx_resume_seed = 0;\n";
-        body_ss << config_.indent << "        switch (_rcont) {\n";
-        {
-            std::set<uint32_t> seen_resume;
-            for (uint32_t c : cps_cur_continuations_) {
-                if (!seen_resume.insert(c).second) continue;
-                body_ss << config_.indent
-                        << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+        if (config_.emit_resume_seed_switch) {
+            body_ss << config_.indent << "{\n";
+            body_ss << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
+            body_ss << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
+            body_ss << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
+            body_ss << config_.indent << "        g_psx_resume_seed = 0;\n";
+            body_ss << config_.indent << "        switch (_rcont) {\n";
+            {
+                std::set<uint32_t> seen_resume;
+                for (uint32_t c : cps_cur_continuations_) {
+                    if (!seen_resume.insert(c).second) continue;
+                    body_ss << config_.indent
+                            << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+                }
             }
+            body_ss << config_.indent << "            default: break;\n";
+            body_ss << config_.indent << "        }\n";
+            body_ss << config_.indent << "    }\n";
+            body_ss << config_.indent << "}\n";
         }
-        body_ss << config_.indent << "            default: break;\n";
-        body_ss << config_.indent << "        }\n";
-        body_ss << config_.indent << "    }\n";
-        body_ss << config_.indent << "}\n";
         body_ss << config_.indent << "if (cpu->pc != 0u) {\n";
         body_ss << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
         body_ss << config_.indent << "    switch (_cont) {\n";
@@ -3568,7 +3570,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // an entry switch; the leaders re-enter via the continuation switch below.
     // Owner = aliases[0]->start_addr (same as the call-return continuations). Skip
     // the alias entry PCs (they are dispatched as function entries with cpu->pc==0).
-    if (cps_enabled_) {
+    if (cps_enabled_ && config_.continuations_all_leaders) {
         std::set<uint32_t> alias_entries;
         for (const Function* a : aliases) alias_entries.insert(a->start_addr);
         for (uint32_t block_addr : cfg.block_order) {
@@ -3597,24 +3599,26 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         // mid-function label was silently defeated by the trampoline's
         // unconditional cpu->pc zeroing; this is a separate, always-safe
         // channel the trampoline and an ordinary return never touch).
-        body << config_.indent << "{\n";
-        body << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
-        body << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
-        body << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
-        body << config_.indent << "        g_psx_resume_seed = 0;\n";
-        body << config_.indent << "        switch (_rcont) {\n";
-        {
-            std::set<uint32_t> seen_resume;
-            for (uint32_t c : cps_cur_continuations_) {
-                if (!seen_resume.insert(c).second) continue;
-                body << config_.indent
-                     << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+        if (config_.emit_resume_seed_switch) {
+            body << config_.indent << "{\n";
+            body << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
+            body << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
+            body << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
+            body << config_.indent << "        g_psx_resume_seed = 0;\n";
+            body << config_.indent << "        switch (_rcont) {\n";
+            {
+                std::set<uint32_t> seen_resume;
+                for (uint32_t c : cps_cur_continuations_) {
+                    if (!seen_resume.insert(c).second) continue;
+                    body << config_.indent
+                         << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+                }
             }
+            body << config_.indent << "            default: break;\n";
+            body << config_.indent << "        }\n";
+            body << config_.indent << "    }\n";
+            body << config_.indent << "}\n";
         }
-        body << config_.indent << "            default: break;\n";
-        body << config_.indent << "        }\n";
-        body << config_.indent << "    }\n";
-        body << config_.indent << "}\n";
         body << config_.indent << "if (cpu->pc != 0u) {\n";
         body << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
         body << config_.indent << "    switch (_cont) {\n";

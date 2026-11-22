@@ -13,6 +13,10 @@
  *
  * The DC runtime provides: g_dc_ram, g_dc_scratch, g_irq_pending, dc_irq_slow
  * and the dc_*_slow accessors.
+ *
+ * dc_irq_slow must service the interrupt in place and return 0: only call
+ * returns are registered as resumable continuations, unless the code was
+ * generated with PSXRECOMP_DC_RESUME_ALL_LEADERS=1.
  */
 #pragma once
 #include <stdint.h>
