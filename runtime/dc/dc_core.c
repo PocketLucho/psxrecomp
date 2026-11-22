@@ -1,0 +1,173 @@
+/* dc_core.c - CPS trampoline, interrupt delivery and runtime glue for --target dc. */
+#include "dc_runtime.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+CPUState g_dc_cpu;
+int g_psx_cps_mode = 1;
+
+#define DC_SENTINEL_RA 0x80000F00u   /* kernel-area return address no guest code uses */
+
+extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
+
+void dc_fatal(const char* fmt, ...)
+{
+    char b[256];
+    va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    dc_host_log("[fatal] "); dc_host_log(b); dc_host_log("\n");
+    snprintf(b, sizeof b,
+             "[stats] dispatches=%llu bios=%llu syscalls=%llu irqs=%llu vblanks=%llu "
+             "gp0=%llu gp1=%llu gpu_dma=%llu cd_cmds=%llu gte=%llu last=%08X\n",
+             (unsigned long long)g_dc_stats.dispatches, (unsigned long long)g_dc_stats.bios_calls,
+             (unsigned long long)g_dc_stats.syscalls, (unsigned long long)g_dc_stats.irqs,
+             (unsigned long long)g_dc_stats.vblanks, (unsigned long long)g_dc_stats.gp0_words,
+             (unsigned long long)g_dc_stats.gp1_writes, (unsigned long long)g_dc_stats.dma_gpu,
+             (unsigned long long)g_dc_stats.cd_cmds, (unsigned long long)g_dc_stats.gte_ops,
+             (unsigned)g_dc_stats.last_addr);
+    dc_host_log(b);
+    exit(1);
+}
+
+/* ---- interrupts -------------------------------------------------------- */
+static int s_in_irq;
+
+static void deliver_irq(CPUState* cpu)
+{
+    g_irq_pending = 0;
+    if (s_in_irq || !dc_bios_irq_enabled()) return;
+    if (!(dc_io_istat() & dc_io_imask())) return;
+    g_dc_stats.irqs++;
+    CPUState saved = *cpu;
+    s_in_irq = 1;
+    dc_bios_interrupt(cpu);
+    s_in_irq = 0;
+    /* The handler may have changed RAM, I_STAT, events and the critical-section
+     * state; the interrupted context's registers come back unchanged. */
+    uint32_t sr = cpu->cop0[12];
+    *cpu = saved;
+    cpu->cop0[12] = sr;
+    if (dc_io_istat() & dc_io_imask()) g_irq_pending = 1;
+}
+
+/* Called by generated code at back-edges when g_irq_pending is set. Services
+ * the interrupt in place and returns 0, as the --target dc contract requires. */
+int dc_irq_slow(CPUState* cpu, uint32_t pc)
+{
+    (void)pc;
+    deliver_irq(cpu);
+    return 0;
+}
+
+int psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc)
+{
+    (void)resume_pc;
+    if (g_irq_pending) deliver_irq(cpu);
+    return 0;
+}
+
+/* ---- trampoline -------------------------------------------------------- */
+static int s_stop_request;   /* set by ReturnFromException in an interrupt handler */
+
+void dc_request_stop(void) { s_stop_request = 1; }
+
+void dc_run(CPUState* cpu, uint32_t addr, uint32_t stop_ra)
+{
+    for (;;) {
+        if (stop_ra && dc_phys(addr) == dc_phys(stop_ra)) return;
+        if (s_stop_request && stop_ra) { s_stop_request = 0; return; }
+        if (g_irq_pending) deliver_irq(cpu);
+        g_dc_stats.dispatches++;
+        g_dc_stats.last_addr = addr;
+        uint32_t p = dc_phys(addr);
+        if (p == 0xA0u || p == 0xB0u || p == 0xC0u) {
+            dc_bios_call(cpu, p);
+            addr = cpu->gpr[31];
+            continue;
+        }
+        if (p >= DC_KSTUB_LO && p < DC_KSTUB_HI) {
+            /* Kernel RAM: BIOS table entries and the BIOS code that libraries
+             * patch or call directly (see dc_bios.c). */
+            dc_bios_kernel_call(cpu, p);
+            addr = cpu->gpr[31];
+            continue;
+        }
+        cpu->pc = 0;
+        if (!psx_dispatch_game_compiled(cpu, addr))
+            dc_fatal("no compiled code at %08X (ra=%08X sp=%08X)", (unsigned)addr,
+                     (unsigned)cpu->gpr[31], (unsigned)cpu->gpr[29]);
+        addr = cpu->pc ? cpu->pc : cpu->gpr[31];
+    }
+}
+
+uint32_t dc_call_guest(CPUState* cpu, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    uint32_t ra = cpu->gpr[31];
+    cpu->gpr[4] = a0; cpu->gpr[5] = a1; cpu->gpr[6] = a2; cpu->gpr[7] = a3;
+    cpu->gpr[31] = DC_SENTINEL_RA;
+    dc_run(cpu, fn, DC_SENTINEL_RA);
+    cpu->gpr[31] = ra;
+    return cpu->gpr[2];
+}
+
+/* ---- glue the generated code links against ----------------------------- */
+int psx_syscall(CPUState* cpu, uint32_t code) { (void)code; g_dc_stats.syscalls++; return dc_bios_syscall(cpu, code); }
+
+void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys)
+{
+    dc_fatal("data executed as code at %08X (phys %08X, ra=%08X)", (unsigned)addr, (unsigned)phys,
+             (unsigned)cpu->gpr[31]);
+}
+
+void psx_restore_state_escape(void) { /* cpu->pc already holds the target */ }
+int  psx_mod_function_entry(CPUState* cpu, uint32_t a) { (void)cpu; (void)a; return 0; }
+int  psx_vsync_query_hle_try(CPUState* cpu, uint32_t a) { (void)cpu; (void)a; return 0; }
+int  psx_game_identity_gate(const void* id) { (void)id; return 1; }
+int  psx_game_identity_bind_static(const void* id) { (void)id; return 1; }
+int  dirty_ram_text_native_ok_ranges_from(const uint32_t* p, uint32_t n, uint32_t pc) { (void)p; (void)n; (void)pc; return 1; }
+int  dirty_ram_text_native_ok_ranges(const uint32_t* p, uint32_t n) { (void)p; (void)n; return 1; }
+int  psx_ws_backdrop_x(int x) { return x; }
+uint32_t psx_ws_guest_cull_xclip_bound(uint32_t v) { return v; }
+_Bool psx_xg_render_auth_resident_ft4_observe(CPUState* c, uint32_t s, uint32_t pc, uint32_t w)
+{ (void)c; (void)s; (void)pc; (void)w; return 0; }
+
+/* GTE: register file only for now; commands are counted. */
+void gte_execute_at(CPUState* cpu, uint32_t cmd, uint32_t pc) { (void)cpu; (void)cmd; (void)pc; g_dc_stats.gte_ops++; }
+uint32_t gte_read_data(CPUState* cpu, uint8_t r) { return cpu->gte_data[r & 31]; }
+uint32_t gte_read_ctrl(CPUState* cpu, uint8_t r) { return cpu->gte_ctrl[r & 31]; }
+void gte_write_data(CPUState* cpu, uint8_t r, uint32_t v) { cpu->gte_data[r & 31] = v; }
+void gte_write_ctrl(CPUState* cpu, uint8_t r, uint32_t v) { cpu->gte_ctrl[r & 31] = v; }
+
+/* ---- boot -------------------------------------------------------------- */
+static uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
+
+int dc_boot_exe(const void* exe, size_t size)
+{
+    const uint8_t* h = (const uint8_t*)exe;
+    if (size < 0x800 || memcmp(h, "PS-X EXE", 8) != 0) return -1;
+    uint32_t pc = rd32(h + 0x10), gp = rd32(h + 0x14), taddr = rd32(h + 0x18), tsize = rd32(h + 0x1C);
+    uint32_t baddr = rd32(h + 0x28), bsize = rd32(h + 0x2C), saddr = rd32(h + 0x30), ssize = rd32(h + 0x34);
+    if (tsize > size - 0x800) tsize = (uint32_t)(size - 0x800);
+    memcpy(dc_ram_ptr(taddr), h + 0x800, tsize);
+    if (bsize) memset(dc_ram_ptr(baddr), 0, bsize);
+
+    CPUState* cpu = &g_dc_cpu;
+    memset(cpu, 0, sizeof *cpu);
+    cpu->read_word = dc_read32;  cpu->write_word = dc_write32;
+    cpu->read_half = dc_read16;  cpu->write_half = dc_write16;
+    cpu->read_byte = dc_read8;   cpu->write_byte = dc_write8;
+    dc_io_reset();
+    dc_bios_init(cpu);
+    cpu->gpr[28] = gp;
+    cpu->gpr[29] = cpu->gpr[30] = saddr ? saddr + ssize : 0x801FFFF0u;
+    cpu->gpr[31] = DC_SENTINEL_RA;
+    char b[128];
+    snprintf(b, sizeof b, "[boot] text %08X+%X entry %08X gp %08X sp %08X\n", (unsigned)taddr,
+             (unsigned)tsize, (unsigned)pc, (unsigned)gp, (unsigned)cpu->gpr[29]);
+    dc_host_log(b);
+    dc_host_start_vblank_timer();
+    dc_run(cpu, pc, DC_SENTINEL_RA);
+    dc_fatal("main returned");
+    return 0;
+}
