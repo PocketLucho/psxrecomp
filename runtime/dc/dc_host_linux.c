@@ -2,6 +2,7 @@
  * program (qemu-sh4), with a 60 Hz VBlank from a host thread. Not for hardware. */
 #include "dc_runtime.h"
 #include "dc_overlay.h"
+#include "dc_gpu.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -78,6 +79,50 @@ void dc_host_start_vblank_timer(void)
     pthread_sigmask(SIG_SETMASK, &old, 0);
 }
 
+/* Frame dumps for testing: DC_FRAME_DIR=dir writes the display area as PPM
+ * every DC_FRAME_EVERY VBlanks (default 60); DC_FRAME_VRAM=1 writes the
+ * whole 1024x512 VRAM instead. */
+static const char* s_frame_dir;
+static int s_frame_every = 60, s_frame_vram;
+
+static void write_ppm(const char* path, int x0, int y0, int w, int h, int depth24)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row = (const uint8_t*)&g_dc_vram[((y0 + y) & 511) * 1024];
+        for (int x = 0; x < w; x++) {
+            uint8_t rgb[3];
+            if (depth24) {
+                int o = (x0 * 2 + x * 3) & 2047;
+                rgb[0] = row[o]; rgb[1] = row[(o + 1) & 2047]; rgb[2] = row[(o + 2) & 2047];
+            } else {
+                uint16_t c = g_dc_vram[((y0 + y) & 511) * 1024 + ((x0 + x) & 1023)];
+                rgb[0] = (uint8_t)((c & 31) << 3); rgb[1] = (uint8_t)(((c >> 5) & 31) << 3);
+                rgb[2] = (uint8_t)(((c >> 10) & 31) << 3);
+            }
+            fwrite(rgb, 1, 3, f);
+        }
+    }
+    fclose(f);
+}
+
+void dc_host_vblank(void)
+{
+    static unsigned n, k;
+    if (!s_frame_dir || ++n % (unsigned)s_frame_every) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/frame_%05u.ppm", s_frame_dir, k++);
+    if (s_frame_vram) { write_ppm(path, 0, 0, 1024, 512, 0); return; }
+    DcGpuDisplay d; dc_gpu_display(&d);
+    if (getenv("DC_FRAME_INFO")) {
+        fprintf(stdout, "[frame] %u display %d,%d %dx%d depth24=%d enabled=%d\n", k - 1, d.x, d.y, d.w, d.h,
+                d.depth24, d.enabled);
+    }
+    write_ppm(path, d.x, d.y, d.w, d.h, d.depth24);
+}
+
 static void on_timeout(int sig) { (void)sig; dc_fatal("time limit reached"); }
 static void on_segv(int sig, siginfo_t* si, void* uc)
 {
@@ -105,6 +150,9 @@ int main(int argc, char** argv)
     sa.sa_sigaction = on_segv; sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0);
     if (getenv("DC_VBLANK_DIV")) s_vblank_div = atoi(getenv("DC_VBLANK_DIV")) > 0 ? atoi(getenv("DC_VBLANK_DIV")) : 10;
+    s_frame_dir = getenv("DC_FRAME_DIR");
+    if (getenv("DC_FRAME_EVERY")) s_frame_every = atoi(getenv("DC_FRAME_EVERY")) > 0 ? atoi(getenv("DC_FRAME_EVERY")) : 60;
+    s_frame_vram = getenv("DC_FRAME_VRAM") != 0;
     /* DC_SKIP=overlay-id@hexaddr[,...]: return at once from those functions */
     if (getenv("DC_SKIP")) dc_overlay_skip_parse(getenv("DC_SKIP"));
     if (argc > 3 && !(s_disc = fopen(argv[3], "rb"))) { perror(argv[3]); return 1; }

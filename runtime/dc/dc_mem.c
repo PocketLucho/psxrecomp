@@ -1,5 +1,6 @@
 /* dc_mem.c - guest memory, slow-path accessors and PS1 I/O for the DC runtime. */
 #include "dc_runtime.h"
+#include "dc_gpu.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,6 @@ DcStats g_dc_stats;
 static uint32_t s_istat, s_imask;
 static uint32_t s_dma_madr[7], s_dma_bcr[7], s_dma_chcr[7], s_dpcr = 0x07654321u, s_dicr;
 static uint32_t s_tmr_mode[3], s_tmr_target[3], s_tmr_base[3];
-static uint32_t s_gpustat_flip;
 static uint8_t  s_io_other[0x2000];    /* plain storage for registers we do not model */
 static uint32_t s_cache_ctrl;
 
@@ -36,6 +36,7 @@ void dc_io_reset(void)
     memset(s_dma_chcr, 0, sizeof s_dma_chcr);
     s_dicr = 0;
     memset(s_io_other, 0, sizeof s_io_other);
+    dc_gpu_reset();
 }
 
 uint32_t dc_io_istat(void) { return s_istat; }
@@ -100,7 +101,10 @@ static void dma_start(int ch)
         uint32_t a = madr, guard = 0;
         while (guard++ < 0x40000u) {
             uint32_t hdr; memcpy(&hdr, g_dc_ram + (a & 0x1FFFFCu), 4);
-            g_dc_stats.gp0_words += hdr >> 24;
+            for (uint32_t i = 1; i <= (hdr >> 24); i++) {
+                uint32_t w; memcpy(&w, g_dc_ram + ((a + 4 * i) & 0x1FFFFCu), 4);
+                dc_gpu_gp0(w);
+            }
             if (hdr & 0x800000u) break;
             a = hdr & 0x1FFFFCu;
         }
@@ -122,7 +126,13 @@ static void dma_start(int ch)
             else memcpy(g_dc_ram + (a & 0x1FFFFCu), s_spu_ram + o, 4);
             s_spu_addr += 4;
         }
-    } else if (ch == 2) {
+    } else if (ch == 2) {                /* GPU block transfer */
+        uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
+        uint32_t a = madr;
+        for (uint32_t i = 0; i < words; i++, a += 4) {
+            if (chcr & 1u) { uint32_t w; memcpy(&w, g_dc_ram + (a & 0x1FFFFCu), 4); dc_gpu_gp0(w); }
+            else { uint32_t w = dc_gpu_read(); memcpy(g_dc_ram + (a & 0x1FFFFCu), &w, 4); }
+        }
         g_dc_stats.dma_gpu++;
     } else {
         log_io("dma start", (uint32_t)ch, chcr);
@@ -195,7 +205,7 @@ static void cd_ack(uint8_t bits)
 static uint64_t s_cd_next_us;
 void dc_io_poll(void)
 {
-    if (dc_host_take_vblanks()) dc_irq_raise(1u);
+    if (dc_host_take_vblanks()) { dc_irq_raise(1u); dc_host_vblank(); }
     if (!s_cd_reading || s_cd_if != 0 || s_cd_npend) return;
     uint64_t now = dc_host_ticks_us();
     if (now < s_cd_next_us) return;
@@ -305,8 +315,8 @@ uint32_t dc_io_read(uint32_t p, int size)
         return 0;
     }
     if (p >= 0x1F801800u && p < 0x1F801804u) return cd_read(p & 3);
-    if (p == 0x1F801810u) return 0;                                  /* GPUREAD */
-    if (p == 0x1F801814u) return 0x1C000000u | ((s_gpustat_flip ^= 1u) << 31); /* GPUSTAT */
+    if (p == 0x1F801810u) return dc_gpu_read();
+    if (p == 0x1F801814u) return dc_gpu_stat();
     if (p == 0x1F801824u) return 0x80040000u;                        /* MDEC status: idle */
     if (p == 0x1F801044u) return 0x00000005u;                        /* JOY_STAT: TX ready */
     if (p == 0x1FFE0130u) return s_cache_ctrl;
@@ -351,8 +361,8 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
         return;
     }
     if (p >= 0x1F801800u && p < 0x1F801804u) { cd_write(p & 3, (uint8_t)v); return; }
-    if (p == 0x1F801810u) { g_dc_stats.gp0_words++; return; }
-    if (p == 0x1F801814u) { g_dc_stats.gp1_writes++; return; }
+    if (p == 0x1F801810u) { dc_gpu_gp0(v); return; }
+    if (p == 0x1F801814u) { dc_gpu_gp1(v); return; }
     if (p == 0x1FFE0130u) { s_cache_ctrl = v; return; }
     if (p == 0x1F801DAAu) { s_spu_cnt = (uint16_t)v; return; }
     if (p == 0x1F801DA6u) { s_spu_addr = (v & 0xFFFFu) << 3; return; }

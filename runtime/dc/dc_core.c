@@ -183,12 +183,7 @@ void psx_xg_render_auth(CPUState* c, uint32_t hook, uint32_t pc, uint32_t a, uin
 _Bool psx_xg_render_auth_resident_ft4_observe(CPUState* c, uint32_t s, uint32_t pc, uint32_t w)
 { (void)c; (void)s; (void)pc; (void)w; return 0; }
 
-/* GTE: register file only for now; commands are counted. */
-void gte_execute_at(CPUState* cpu, uint32_t cmd, uint32_t pc) { (void)cpu; (void)cmd; (void)pc; g_dc_stats.gte_ops++; }
-uint32_t gte_read_data(CPUState* cpu, uint8_t r) { return cpu->gte_data[r & 31]; }
-uint32_t gte_read_ctrl(CPUState* cpu, uint8_t r) { return cpu->gte_ctrl[r & 31]; }
-void gte_write_data(CPUState* cpu, uint8_t r, uint32_t v) { cpu->gte_data[r & 31] = v; }
-void gte_write_ctrl(CPUState* cpu, uint8_t r, uint32_t v) { cpu->gte_ctrl[r & 31] = v; }
+/* GTE: dc_gte.c */
 
 __attribute__((weak)) void dc_game_init(CPUState* cpu) { (void)cpu; }
 

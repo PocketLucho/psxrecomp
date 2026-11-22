@@ -78,5 +78,7 @@ void dc_host_start_vblank_timer(void);
  * them and sets g_irq_pending; the core raises the interrupt from dc_io_poll,
  * so device state is touched by the guest thread alone. */
 unsigned dc_host_take_vblanks(void);
+/* Called on the guest thread at each delivered VBlank: present a frame. */
+void dc_host_vblank(void);
 /* Read one raw 2352-byte sector (LBA from the start of the data track); 0 on success. */
 int  dc_host_cd_read_sector(uint32_t lba, uint8_t* out2352);
