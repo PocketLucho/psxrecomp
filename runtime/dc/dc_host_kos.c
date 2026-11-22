@@ -130,6 +130,8 @@ static void video_init(void)
  * shown yet. */
 void dc_host_vblank(void)
 {
+    static unsigned n;
+    if (++n < 180) return;          /* leave the boot messages up for ~3 s */
     DcGpuDisplay d; dc_gpu_display(&d);
     if (!d.enabled || d.depth24 || d.w <= 0 || d.h <= 0) return;
     int sx = d.w <= 320 ? 2 : 1, sy = d.h <= 240 ? 2 : 1;
@@ -158,19 +160,53 @@ static int open_first(const char* const* paths, void** data, size_t* size, const
     return -1;
 }
 
+/* Boot steps are printed on screen (KOS debug output on the framebuffer) with
+ * a pause after each, so a crash leaves the last step reached visible. The
+ * PS1 picture replaces them once the game has run for a few seconds. */
+static void step(const char* msg)
+{
+    dbglog(DBG_INFO, "%s\n", msg);
+    thd_sleep(700);
+}
+
+/* Keep the screen as it is after a fatal error instead of rebooting. */
+static void hang_at_exit(void) { for (;;) thd_sleep(1000); }
+
+static void* s_exe; static size_t s_exe_size;
+
+static void* game_thread(void* arg)
+{
+    (void)arg;
+    step("[xg] 5/5 starting the game");
+    return (void*)(intptr_t)dc_boot_exe(s_exe, s_exe_size);
+}
+
 int main(int argc, char** argv)
 {
     (void)argc; (void)argv;
     video_init();
+    dbgio_dev_select("fb");
+    atexit(hang_at_exit);
+    step("[xg] XenoTest Dreamcast - diagnostic boot");
+    step("[xg] 1/5 KallistiOS and video ready");
     static const char* const exe_paths[] = {"/cd/PSX.EXE", "/pc/PSX.EXE", "/rd/PSX.EXE", 0};
     static const char* const disc_paths[] = {"/cd/DISC.BIN", "/pc/DISC.BIN", 0};
-    void* exe; size_t n; const char* used;
-    if (open_first(exe_paths, &exe, &n, &used)) { dbglog(DBG_ERROR, "[host] PSX.EXE not found\n"); return 1; }
-    dbglog(DBG_INFO, "[host] EXE %s (%u bytes)\n", used, (unsigned)n);
-    for (int i = 0; disc_paths[i] && s_disc == FILEHND_INVALID; i++) {
+    const char* used;
+    if (open_first(exe_paths, &s_exe, &s_exe_size, &used)) { step("[xg] ERROR: PSX.EXE not found"); return 1; }
+    dbglog(DBG_INFO, "[xg] 2/5 EXE %s (%u bytes)\n", used, (unsigned)s_exe_size);
+    thd_sleep(700);
+    for (int i = 0; disc_paths[i] && s_disc == FILEHND_INVALID; i++)
         s_disc = fs_open(disc_paths[i], O_RDONLY);
-        if (s_disc != FILEHND_INVALID) dbglog(DBG_INFO, "[host] disc %s\n", disc_paths[i]);
-    }
-    if (s_disc == FILEHND_INVALID) dbglog(DBG_WARNING, "[host] DISC.BIN not found; CD reads will fail\n");
-    return dc_boot_exe(exe, n);
+    step(s_disc == FILEHND_INVALID ? "[xg] 3/5 WARNING: DISC.BIN not found" : "[xg] 3/5 disc image open");
+    uint8_t sec[2352];
+    step(dc_host_cd_read_sector(16, sec) == 0 ? "[xg] 4/5 disc sector read ok" : "[xg] 4/5 ERROR: disc sector read failed");
+    /* The kernel thread has a 64 KB stack; give the game 1 MB. */
+    kthread_attr_t at = {0};
+    at.stack_size = 1024 * 1024;
+    at.label = "game";
+    kthread_t* t = thd_create_ex(&at, game_thread, 0);
+    if (!t) { step("[xg] ERROR: cannot create the game thread"); return 1; }
+    void* rv = 0;
+    thd_join(t, &rv);
+    return (int)(intptr_t)rv;
 }
