@@ -12,6 +12,30 @@ int g_psx_cps_mode = 1;
 
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 
+/* Tiny sampling profile of the last dispatched address (host timer). */
+static volatile uint32_t s_last_poll_pc;
+static uint32_t s_prof_addr[64], s_prof_hits[64];
+void dc_profile_sample(void)
+{
+    uint32_t a = s_last_poll_pc ? s_last_poll_pc : g_dc_stats.last_addr;
+    for (int i = 0; i < 64; i++) {
+        if (s_prof_hits[i] && s_prof_addr[i] == a) { s_prof_hits[i]++; return; }
+        if (!s_prof_hits[i]) { s_prof_addr[i] = a; s_prof_hits[i] = 1; return; }
+    }
+}
+static void profile_dump(void)
+{
+    char b[64];
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int i = 0; i < 64; i++) if (s_prof_hits[i] && (best < 0 || s_prof_hits[i] > s_prof_hits[best])) best = i;
+        if (best < 0) break;
+        snprintf(b, sizeof b, "[prof] %08X %u\n", (unsigned)s_prof_addr[best], (unsigned)s_prof_hits[best]);
+        dc_host_log(b);
+        s_prof_hits[best] = 0;
+    }
+}
+
 void dc_fatal(const char* fmt, ...)
 {
     char b[256];
@@ -27,6 +51,7 @@ void dc_fatal(const char* fmt, ...)
              (unsigned long long)g_dc_stats.cd_cmds, (unsigned long long)g_dc_stats.gte_ops,
              (unsigned)g_dc_stats.last_addr);
     dc_host_log(b);
+    profile_dump();
     exit(1);
 }
 
@@ -36,6 +61,7 @@ static int s_in_irq;
 static void deliver_irq(CPUState* cpu)
 {
     g_irq_pending = 0;
+    dc_io_poll();
     if (s_in_irq || !dc_bios_irq_enabled()) return;
     if (!(dc_io_istat() & dc_io_imask())) return;
     g_dc_stats.irqs++;
@@ -55,7 +81,7 @@ static void deliver_irq(CPUState* cpu)
  * the interrupt in place and returns 0, as the --target dc contract requires. */
 int dc_irq_slow(CPUState* cpu, uint32_t pc)
 {
-    (void)pc;
+    if (!s_in_irq) s_last_poll_pc = pc;
     deliver_irq(cpu);
     return 0;
 }

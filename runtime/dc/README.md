@@ -26,13 +26,23 @@ for f in dc_mem dc_core dc_bios dc_host_linux; do
   sh4-linux-gnu-gcc $CFLAGS -c $R/dc/$f.c -o obj/$f.o
 done
 sh4-linux-gnu-gcc -static -o xg_dc obj/*.o
-qemu-sh4 xg_dc path/to/SLUS_006.64 20   # second argument: CPU-time limit in seconds
+# arguments: EXE, CPU-time limit in seconds, raw 2352-byte disc image (.bin)
+DC_VBLANK_DIV=1 qemu-sh4 xg_dc path/to/SLUS_006.64 60 path/to/disc1.bin
 ```
+
+`DC_VBLANK_DIV` sets the VBlank rate as a divider of a 600 Hz tick (10 =
+60 Hz, the default). qemu runs the guest much faster than a PS1, so PSY-Q's
+iteration-count timeouts (for example in `VSync`) fire before a 60 Hz VBlank;
+`DC_VBLANK_DIV=1` avoids most of them. `DC_CD_TRACE=1` logs CD interrupts.
 
 ## Status
 
 Xenogears' main EXE boots, runs its library initialisation (pad, card, CD,
-interrupt manager), receives VBlank interrupts through its own handler, prints
-`CD_init:` and starts reading the disc (`Setloc 24:12:04`, `ReadN`). Disc
-access is the next step. GTE commands are counted but not executed yet, and
-the GPU only counts GP0 words.
+SPU, interrupt manager), receives VBlank interrupts through its own handler,
+reads real sectors from the disc (Setloc/ReadN/Pause, CD DMA), uploads sound
+data to SPU RAM and sends its first GPU commands. It then jumps to
+`0x800737EC`, code it loaded from the disc into RAM above the main EXE: the
+overlays have to be compiled for `--target dc` next.
+
+Not done yet: GTE commands are counted but not executed, the GPU only counts
+GP0 words, the SPU stores sound RAM but does not mix voices.

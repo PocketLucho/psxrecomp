@@ -32,6 +32,7 @@ void     dc_irq_raise(uint32_t bits);   /* sets I_STAT bits, arms g_irq_pending 
 uint32_t dc_io_istat(void);
 uint32_t dc_io_imask(void);
 void     dc_io_ack(uint32_t bits);
+void     dc_io_poll(void);              /* timed device events (CD sectors) */
 
 /* ---- execution ---- */
 extern CPUState g_dc_cpu;
@@ -40,6 +41,7 @@ void dc_run(CPUState* cpu, uint32_t addr, uint32_t stop_ra);
 /* Call a guest function with up to 4 args and return v0 (nested, preserves caller state). */
 uint32_t dc_call_guest(CPUState* cpu, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);
 void dc_fatal(const char* fmt, ...);
+void dc_profile_sample(void);
 int  dc_irq_slow(CPUState* cpu, uint32_t pc);
 
 /* ---- BIOS HLE ---- */
@@ -68,3 +70,5 @@ void dc_host_log(const char* s);
 uint64_t dc_host_ticks_us(void);
 int  dc_host_read_file(const char* path, void** data, size_t* size);
 void dc_host_start_vblank_timer(void);
+/* Read one raw 2352-byte sector (LBA from the start of the data track); 0 on success. */
+int  dc_host_cd_read_sector(uint32_t lba, uint8_t* out2352);

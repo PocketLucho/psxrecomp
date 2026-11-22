@@ -71,6 +71,7 @@ static void trace(char tbl, uint32_t fn, CPUState* cpu)
 {
     static int n;
     if (tbl == 'B' && (fn == 0x35 || fn == 0x3D)) return;   /* tty output */
+    if (tbl == 'B' && fn == 0x17) return;               /* ReturnFromException */
     if (n++ < 400) {
         char b[96];
         snprintf(b, sizeof b, "[bios] %c0:%02X a0=%08X a1=%08X ra=%08X\n", tbl, (unsigned)fn,

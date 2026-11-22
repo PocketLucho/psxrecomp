@@ -2,6 +2,7 @@
 #include "dc_runtime.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 uint8_t g_dc_ram[0x200000] __attribute__((aligned(32)));
 uint8_t g_dc_scratch[1024] __attribute__((aligned(32)));
@@ -15,6 +16,13 @@ static uint32_t s_tmr_mode[3], s_tmr_target[3], s_tmr_base[3];
 static uint32_t s_gpustat_flip;
 static uint8_t  s_io_other[0x2000];    /* plain storage for registers we do not model */
 static uint32_t s_cache_ctrl;
+
+/* SPU: 512 KB sound RAM and the registers libspu polls. Voices are not mixed
+ * yet; the AICA port will replace this. */
+static uint8_t  s_spu_ram[512 * 1024];
+static uint32_t s_spu_addr;              /* transfer address in bytes */
+static uint16_t s_spu_cnt;
+static uint16_t spu_stat(void) { return (uint16_t)(s_spu_cnt & 0x3Fu); }
 
 /* CD-ROM controller: enough to answer commands with a status byte. */
 static uint8_t  s_cd_index, s_cd_ie, s_cd_if, s_cd_stat = 0x02;
@@ -76,6 +84,8 @@ static void dma_finish(int ch)
     }
 }
 
+uint32_t dc_cd_fifo_read(uint8_t* dst, uint32_t n);
+
 static void dma_start(int ch)
 {
     uint32_t madr = s_dma_madr[ch] & 0x1FFFFCu, bcr = s_dma_bcr[ch], chcr = s_dma_chcr[ch];
@@ -95,6 +105,23 @@ static void dma_start(int ch)
             a = hdr & 0x1FFFFCu;
         }
         g_dc_stats.dma_gpu++;
+    } else if (ch == 3) {                /* CD-ROM -> RAM */
+        uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
+        if (!words) words = 0x10000u;
+        uint32_t a = madr;
+        for (uint32_t i = 0; i < words; i++, a += 4) {
+            uint8_t w[4]; dc_cd_fifo_read(w, 4);
+            memcpy(g_dc_ram + (a & 0x1FFFFCu), w, 4);
+        }
+    } else if (ch == 4) {                /* SPU: RAM <-> sound RAM */
+        uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
+        uint32_t a = madr;
+        for (uint32_t i = 0; i < words; i++, a += 4) {
+            uint32_t o = s_spu_addr & 0x7FFFCu;
+            if (chcr & 1u) memcpy(s_spu_ram + o, g_dc_ram + (a & 0x1FFFFCu), 4);
+            else memcpy(g_dc_ram + (a & 0x1FFFFCu), s_spu_ram + o, 4);
+            s_spu_addr += 4;
+        }
     } else if (ch == 2) {
         g_dc_stats.dma_gpu++;
     } else {
@@ -108,8 +135,11 @@ typedef struct { uint8_t irq, n, r[8]; } CdResp;
 static CdResp s_cd_pend[4];
 static int s_cd_npend;
 
+static int s_cd_trace = -1;
 static void cd_deliver(const CdResp* r)
 {
+    if (s_cd_trace < 0) s_cd_trace = getenv("DC_CD_TRACE") != 0;
+    if (s_cd_trace) { char b[64]; snprintf(b, sizeof b, "[cd] INT%u n=%u r0=%02X ie=%02X\n", r->irq, r->n, r->r[0], s_cd_ie); dc_host_log(b); }
     s_cd_nresp = r->n; s_cd_rpos = 0;
     memcpy(s_cd_resp, r->r, r->n);
     s_cd_if = r->irq;
@@ -125,6 +155,31 @@ static void cd_respond(uint8_t irq, int n, const uint8_t* r)
     else if (s_cd_npend < 4) s_cd_pend[s_cd_npend++] = x;
 }
 
+/* Sector reading: Setloc target, ReadN/ReadS stream one INT1 per sector,
+ * paced by the game's acknowledgements. */
+static uint32_t s_cd_lba, s_cd_mode;
+static int s_cd_reading, s_cd_sector_ready;
+static uint8_t s_cd_sector[2352];
+static uint8_t s_cd_fifo[2352];
+static uint32_t s_cd_fifo_len, s_cd_fifo_pos;
+
+static uint32_t bcd(uint8_t v) { return (uint32_t)((v >> 4) * 10 + (v & 15)); }
+
+static void cd_next_sector(void)
+{
+    if (dc_host_cd_read_sector(s_cd_lba, s_cd_sector) != 0) {
+        static const uint8_t err[2] = {0x03, 0x80};
+        s_cd_reading = 0;
+        cd_respond(5, 2, err);
+        dc_host_log("[cd] read failed: no disc image or sector out of range\n");
+        return;
+    }
+    s_cd_lba++;
+    s_cd_sector_ready = 1;
+    s_cd_stat = 0x22;
+    cd_respond(1, 1, &s_cd_stat);
+}
+
 static void cd_ack(uint8_t bits)
 {
     s_cd_if &= ~bits;
@@ -135,6 +190,36 @@ static void cd_ack(uint8_t bits)
     }
 }
 
+/* Called from the interrupt path: deliver the next sector of a running read
+ * once the drive would have it (75 sectors/s, 150 at double speed). */
+static uint64_t s_cd_next_us;
+void dc_io_poll(void)
+{
+    if (!s_cd_reading || s_cd_if != 0 || s_cd_npend) return;
+    uint64_t now = dc_host_ticks_us();
+    if (now < s_cd_next_us) return;
+    s_cd_next_us = now + ((s_cd_mode & 0x80) ? 6667u : 13333u);
+    cd_next_sector();
+}
+
+static void cd_load_fifo(void)
+{
+    if (s_cd_trace > 0) { char b[48]; snprintf(b, sizeof b, "[cd] fifo load ready=%d\n", s_cd_sector_ready); dc_host_log(b); }
+    if (!s_cd_sector_ready) return;
+    if (s_cd_mode & 0x20) { memcpy(s_cd_fifo, s_cd_sector + 12, 2340); s_cd_fifo_len = 2340; }
+    else { memcpy(s_cd_fifo, s_cd_sector + 24, 2048); s_cd_fifo_len = 2048; }
+    s_cd_fifo_pos = 0;
+    s_cd_sector_ready = 0;
+}
+
+uint32_t dc_cd_fifo_read(uint8_t* dst, uint32_t n)
+{
+    uint32_t i = 0;
+    for (; i < n && s_cd_fifo_pos < s_cd_fifo_len; i++) dst[i] = s_cd_fifo[s_cd_fifo_pos++];
+    for (; i < n; i++) dst[i] = 0;
+    return n;
+}
+
 static void cd_command(uint8_t cmd)
 {
     char b[80];
@@ -143,9 +228,15 @@ static void cd_command(uint8_t cmd)
         snprintf(b, sizeof b, "[cd] Setloc %02X:%02X:%02X\n", s_cd_param[0], s_cd_param[1], s_cd_param[2]);
     else
         snprintf(b, sizeof b, "[cd] cmd %02X (%d params)\n", cmd, s_cd_nparam);
-    dc_host_log(b);
-    uint8_t st = s_cd_stat;
+    if (cmd != 0x01 && g_dc_stats.cd_cmds < 400) dc_host_log(b);
+    if (s_cd_reading && cmd != 0x01) { s_cd_reading = 0; s_cd_npend = 0; }
+    uint8_t st = s_cd_stat = s_cd_reading ? 0x22 : 0x02;
     switch (cmd) {
+    case 0x02:                           /* Setloc mm:ss:ff (BCD) */
+        if (s_cd_nparam >= 3)
+            s_cd_lba = (bcd(s_cd_param[0]) * 60 + bcd(s_cd_param[1])) * 75 + bcd(s_cd_param[2]) - 150;
+        cd_respond(3, 1, &st); break;
+    case 0x0E: s_cd_mode = s_cd_param[0]; cd_respond(3, 1, &st); break;   /* Setmode */
     case 0x19: {                         /* Test */
         static const uint8_t ver[4] = {0x94, 0x09, 0x19, 0xC0};
         cd_respond(3, 4, ver); break;
@@ -156,12 +247,11 @@ static void cd_command(uint8_t cmd)
     }
     case 0x07: case 0x08: case 0x09: case 0x0A: case 0x15: case 0x16:
         cd_respond(3, 1, &st); cd_respond(2, 1, &st); break;   /* MotorOn/Stop/Pause/Init/SeekL/SeekP */
-    case 0x06: case 0x1B: {              /* ReadN/ReadS: no disc image yet */
-        static const uint8_t err[2] = {0x03, 0x80};
-        cd_respond(3, 1, &st); cd_respond(5, 2, err);
-        dc_host_log("[cd] read requested: no disc image attached\n");
+    case 0x06: case 0x1B:                /* ReadN/ReadS */
+        cd_respond(3, 1, &st);
+        s_cd_reading = 1;
+        s_cd_next_us = dc_host_ticks_us() + 20000u;   /* seek time */
         break;
-    }
     default:
         cd_respond(3, 1, &st);
         break;
@@ -173,8 +263,10 @@ static uint32_t cd_read(uint32_t reg)
 {
     switch (reg) {
     case 0: return (uint32_t)(s_cd_index | (s_cd_nparam == 0 ? 0x08 : 0) | 0x10 |
-                              (s_cd_rpos < s_cd_nresp ? 0x20 : 0));
+                              (s_cd_rpos < s_cd_nresp ? 0x20 : 0) |
+                              (s_cd_fifo_pos < s_cd_fifo_len ? 0x40 : 0));
     case 1: return s_cd_rpos < s_cd_nresp ? s_cd_resp[s_cd_rpos++] : 0;
+    case 2: return s_cd_fifo_pos < s_cd_fifo_len ? s_cd_fifo[s_cd_fifo_pos++] : 0;
     case 3: return (s_cd_index & 1) ? (0xE0u | s_cd_if) : (0xE0u | s_cd_ie);
     default: return 0;
     }
@@ -186,6 +278,7 @@ static void cd_write(uint32_t reg, uint8_t v)
     switch (s_cd_index * 4 + reg) {
     case 1: cd_command(v); break;                                   /* 0:1 command */
     case 2: if (s_cd_nparam < 16) s_cd_param[s_cd_nparam++] = v; break; /* 0:2 param */
+    case 3: if (v & 0x80) cd_load_fifo(); else s_cd_fifo_len = s_cd_fifo_pos = 0; break; /* 0:3 request */
     case 6: s_cd_ie = v & 0x1F; break;                              /* 1:2 int enable */
     case 7: cd_ack(v & 0x1F); break;                                /* 1:3 int flag ack */
     default: break;
@@ -216,6 +309,9 @@ uint32_t dc_io_read(uint32_t p, int size)
     if (p == 0x1F801824u) return 0x80040000u;                        /* MDEC status: idle */
     if (p == 0x1F801044u) return 0x00000005u;                        /* JOY_STAT: TX ready */
     if (p == 0x1FFE0130u) return s_cache_ctrl;
+    if (p == 0x1F801DAAu) return s_spu_cnt;
+    if (p == 0x1F801DAEu) return spu_stat();
+    if (p == 0x1F801DA6u) return (s_spu_addr >> 3) & 0xFFFFu;
     if (p >= 0x1F801000u && p < 0x1F803000u) {
         uint32_t o = p - 0x1F801000u, v = 0;
         memcpy(&v, s_io_other + (o & 0x1FFCu), 4);
@@ -257,6 +353,12 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
     if (p == 0x1F801810u) { g_dc_stats.gp0_words++; return; }
     if (p == 0x1F801814u) { g_dc_stats.gp1_writes++; return; }
     if (p == 0x1FFE0130u) { s_cache_ctrl = v; return; }
+    if (p == 0x1F801DAAu) { s_spu_cnt = (uint16_t)v; return; }
+    if (p == 0x1F801DA6u) { s_spu_addr = (v & 0xFFFFu) << 3; return; }
+    if (p == 0x1F801DA8u) {              /* manual FIFO write */
+        uint16_t h = (uint16_t)v; memcpy(s_spu_ram + (s_spu_addr & 0x7FFFEu), &h, 2); s_spu_addr += 2;
+        return;
+    }
     if (p >= 0x1F801000u && p < 0x1F803000u) {
         uint32_t o = (p - 0x1F801000u) & 0x1FFFu;
         if (size == 4) memcpy(s_io_other + (o & ~3u), &v, 4);
