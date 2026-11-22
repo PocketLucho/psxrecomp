@@ -88,3 +88,11 @@ int main(int argc, char** argv)
     }
     return dc_boot_exe(exe, n);
 }
+
+/* Report where a stack-protector check failed instead of libc's bare abort. */
+void __stack_chk_fail(void)
+{
+    char b[80];
+    snprintf(b, sizeof b, "stack smashing in host code called from %p", __builtin_return_address(0));
+    dc_fatal("%s", b);
+}

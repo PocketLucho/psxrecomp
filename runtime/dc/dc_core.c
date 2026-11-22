@@ -1,5 +1,6 @@
 /* dc_core.c - CPS trampoline, interrupt delivery and runtime glue for --target dc. */
 #include "dc_runtime.h"
+#include "dc_overlay.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,9 +121,11 @@ void dc_run(CPUState* cpu, uint32_t addr, uint32_t stop_ra)
             continue;
         }
         cpu->pc = 0;
-        if (!psx_dispatch_game_compiled(cpu, addr))
+        if (!psx_dispatch_game_compiled(cpu, addr) && !dc_overlay_dispatch(cpu, addr)) {
+            dc_overlay_explain(addr);
             dc_fatal("no compiled code at %08X (ra=%08X sp=%08X)", (unsigned)addr,
                      (unsigned)cpu->gpr[31], (unsigned)cpu->gpr[29]);
+        }
         addr = cpu->pc ? cpu->pc : cpu->gpr[31];
     }
 }
@@ -146,6 +149,13 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys)
              (unsigned)cpu->gpr[31]);
 }
 
+void psx_native_bad_entry(CPUState* cpu, uint32_t owner, uint32_t pc)
+{
+    dc_overlay_explain(pc);
+    dc_fatal("bad continuation %08X in function %08X (ra=%08X)", (unsigned)pc, (unsigned)owner,
+             (unsigned)cpu->gpr[31]);
+}
+
 void psx_restore_state_escape(void) { /* cpu->pc already holds the target */ }
 int  psx_mod_function_entry(CPUState* cpu, uint32_t a) { (void)cpu; (void)a; return 0; }
 int  psx_vsync_query_hle_try(CPUState* cpu, uint32_t a) { (void)cpu; (void)a; return 0; }
@@ -155,6 +165,8 @@ int  dirty_ram_text_native_ok_ranges_from(const uint32_t* p, uint32_t n, uint32_
 int  dirty_ram_text_native_ok_ranges(const uint32_t* p, uint32_t n) { (void)p; (void)n; return 1; }
 int  psx_ws_backdrop_x(int x) { return x; }
 uint32_t psx_ws_guest_cull_xclip_bound(uint32_t v) { return v; }
+void psx_xg_render_auth(CPUState* c, uint32_t hook, uint32_t pc, uint32_t a, uint32_t b)
+{ (void)c; (void)hook; (void)pc; (void)a; (void)b; }
 _Bool psx_xg_render_auth_resident_ft4_observe(CPUState* c, uint32_t s, uint32_t pc, uint32_t w)
 { (void)c; (void)s; (void)pc; (void)w; return 0; }
 
