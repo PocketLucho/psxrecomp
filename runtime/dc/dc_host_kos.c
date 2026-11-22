@@ -22,6 +22,7 @@
 #include <dc/video.h>
 #include <dc/cdrom.h>
 #include <dc/biosfont.h>
+#include <dc/sq.h>
 #include <arch/timer.h>
 #include <arch/cache.h>
 #include <stdio.h>
@@ -229,7 +230,7 @@ void dc_host_code_written(void* p, uint32_t n)
 }
 
 /* ---- VBlank ----------------------------------------------------------- */
-static volatile unsigned s_vblanks;
+static volatile unsigned s_vblanks, s_vblanks_total;
 
 unsigned dc_host_take_vblanks(void) { return __atomic_exchange_n(&s_vblanks, 0u, __ATOMIC_ACQ_REL); }
 
@@ -238,7 +239,12 @@ unsigned dc_host_take_vblanks(void) { return __atomic_exchange_n(&s_vblanks, 0u,
 static void on_vblank(uint32_t code, void* data)
 {
     (void)code; (void)data;
-    s_vblanks++;
+    s_vblanks++; s_vblanks_total++;
+#ifdef DC_PROFILE
+    { extern uint32_t g_prof_pc[1024], g_prof_pr[1024]; extern volatile unsigned g_prof_n;
+      irq_context_t* c = arch_irq_get_context();
+      if (c && g_prof_n < 1024) { g_prof_pc[g_prof_n] = c->pc; g_prof_pr[g_prof_n] = c->pr; g_prof_n++; } }
+#endif
     g_irq_pending = 1;
 }
 
@@ -285,27 +291,63 @@ static void video_init(void)
 /* Copy the PS1 display area to the 640x480 framebuffer, doubling pixels for
  * 320-wide modes and lines for 240-line modes. 24-bit (movie) modes are not
  * shown yet. */
+/* Speed report on the serial console every 10 s of console time: how many
+ * VBlanks the guest saw and how many times it moved its display area (one
+ * per finished game frame), against the 600 real VBlanks. */
+#ifdef DC_PROFILE
+uint32_t g_prof_pc[1024], g_prof_pr[1024]; volatile unsigned g_prof_n;
+#endif
+static void perf_report(const DcGpuDisplay* d)
+{
+    static unsigned polls, flips, last_total, lx = ~0u, ly = ~0u;
+    polls++;
+    if ((unsigned)d->x != lx || (unsigned)d->y != ly) { flips++; lx = (unsigned)d->x; ly = (unsigned)d->y; }
+    unsigned t = s_vblanks_total;
+    if (t - last_total >= 600) {
+        char b[96];
+        snprintf(b, sizeof b, "[perf] %u vblanks: guest saw %u, %u frames drawn\n", t - last_total, polls, flips);
+        dbgio_write_str(b);
+        last_total = t; polls = flips = 0;
+#ifdef DC_PROFILE
+        unsigned n = g_prof_n;
+        for (unsigned i = 0; i < n; i++) {
+            snprintf(b, sizeof b, "[pc] %08lx %08lx\n", (unsigned long)g_prof_pc[i], (unsigned long)g_prof_pr[i]);
+            dbgio_write_str(b);
+        }
+        g_prof_n = 0;
+#endif
+    }
+}
+
 void dc_host_vblank(void)
 {
     static unsigned n;
-    if (++n < 180) return;          /* leave the boot messages up for ~3 s */
     DcGpuDisplay d; dc_gpu_display(&d);
+    perf_report(&d);
+    if (++n < 180) return;          /* leave the boot messages up for ~3 s */
     if (!d.enabled || d.depth24 || d.w <= 0 || d.h <= 0) return;
     int sx = d.w <= 320 ? 2 : 1, sy = d.h <= 240 ? 2 : 1;
     int w = d.w * sx > 640 ? 640 / sx : d.w, h = d.h * sy > 480 ? 480 / sy : d.h;
+    /* Each output line is built in a cached buffer and sent to video memory
+     * with the store queues (32-byte bursts), once or twice for doubled
+     * lines: writing video memory a pixel at a time, and reading it back to
+     * double a line, cost several milliseconds per frame. */
+    static uint32_t line[320] __attribute__((aligned(32)));
+    int bytes = ((w * sx * 2) + 31) & ~31;
     for (int y = 0; y < h; y++) {
         const uint16_t* src = &g_dc_vram[((d.y + y) & 511) * 1024];
-        uint16_t* dst = vram_s + (y * sy) * 640;
         if (sx == 2) {
-            uint32_t* d32 = (uint32_t*)dst;
             for (int x = 0; x < w; x++) {
                 uint32_t p = s_bgr2rgb[src[(d.x + x) & 1023] & 0x7FFF];
-                d32[x] = p | (p << 16);
+                line[x] = p | (p << 16);
             }
         } else {
-            for (int x = 0; x < w; x++) dst[x] = s_bgr2rgb[src[(d.x + x) & 1023] & 0x7FFF];
+            uint16_t* l16 = (uint16_t*)line;
+            for (int x = 0; x < w; x++) l16[x] = s_bgr2rgb[src[(d.x + x) & 1023] & 0x7FFF];
         }
-        if (sy == 2) memcpy(dst + 640, dst, (size_t)(w * sx) * 2);
+        uint16_t* dst = vram_s + (y * sy) * 640;
+        sq_cpy(dst, line, (size_t)bytes);
+        if (sy == 2) sq_cpy(dst + 640, line, (size_t)bytes);
     }
 }
 

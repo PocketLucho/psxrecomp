@@ -120,9 +120,79 @@ static inline void shade_pixel(const Shade* s, int x, int y, int r, int g, int b
 /* ---------------------------------------------------------------- triangles */
 typedef struct { int x, y, r, g, b, u, v; } Vtx;
 
+/* One horizontal span of a polygon, specialised at compile time on
+ * textured / gouraud / semi-transparent / modulated. Clipping is done by the
+ * caller. at[] holds r,g,b,u,v in 16.16 and dx[] their per-pixel steps. */
+typedef struct {
+    uint32_t mask_u, or_u, mask_v, or_v, tp_x, tp_y, depth, semi_mode;
+    const uint16_t* clut_row; uint32_t clut_x;
+    int r, g, b;              /* flat colour */
+    uint16_t set_bit; int check_mask;
+} SpanCtx;
+
+static void span_setup(SpanCtx* c, const Shade* s, int r, int g, int b)
+{
+    c->mask_u = 0xFF & ~(G.tw_mask_x * 8); c->or_u = (G.tw_off_x & G.tw_mask_x) * 8;
+    c->mask_v = 0xFF & ~(G.tw_mask_y * 8); c->or_v = (G.tw_off_y & G.tw_mask_y) * 8;
+    c->tp_x = s->tp_x; c->tp_y = s->tp_y; c->depth = s->depth; c->semi_mode = s->semi_mode;
+    c->clut_row = &g_dc_vram[(s->clut_y & 511) << 10]; c->clut_x = s->clut_x;
+    c->r = r; c->g = g; c->b = b;
+    c->set_bit = G.set_mask ? 0x8000 : 0; c->check_mask = G.check_mask;
+}
+
+static inline __attribute__((always_inline)) void span(const SpanCtx* c, uint16_t* drow, int x, int n,
+    int32_t* at, const int32_t* dx, const int TEX, const int GOUR, const int SEMI, const int MOD)
+{
+    int32_t r = at[0], g = at[1], b = at[2], u = at[3], v = at[4];
+    const int32_t dr = dx[0], dg = dx[1], db = dx[2], du = dx[3], dv = dx[4];
+    for (; n > 0; n--, x++) {
+        int cr = GOUR ? r >> 16 : c->r, cg = GOUR ? g >> 16 : c->g, cb = GOUR ? b >> 16 : c->b;
+        uint16_t col;
+        int semi = SEMI;
+        if (TEX) {
+            uint32_t tu = (((uint32_t)u >> 16) & c->mask_u) | c->or_u;
+            uint32_t tv = (((uint32_t)v >> 16) & c->mask_v) | c->or_v;
+            const uint16_t* trow = &g_dc_vram[((c->tp_y + tv) & 511) << 10];
+            uint16_t t;
+            if (c->depth == 0) {
+                uint16_t w = trow[(c->tp_x + (tu >> 2)) & 1023];
+                t = c->clut_row[(c->clut_x + ((w >> ((tu & 3) * 4)) & 0xF)) & 1023];
+            } else if (c->depth == 1) {
+                uint16_t w = trow[(c->tp_x + (tu >> 1)) & 1023];
+                t = c->clut_row[(c->clut_x + ((w >> ((tu & 1) * 8)) & 0xFF)) & 1023];
+            } else
+                t = trow[(c->tp_x + tu) & 1023];
+            u += du; v += dv;
+            if (GOUR) { r += dr; g += dg; b += db; }
+            if (!t) continue;
+            col = t;
+            if (MOD) {
+                int tr = ((t & 31) * cr) >> 7, tg = (((t >> 5) & 31) * cg) >> 7, tb = (((t >> 10) & 31) * cb) >> 7;
+                col = (uint16_t)((tr > 31 ? 31 : tr) | ((tg > 31 ? 31 : tg) << 5) | ((tb > 31 ? 31 : tb) << 10) | (t & 0x8000));
+            }
+            semi = SEMI && (t & 0x8000);
+        } else {
+            col = (uint16_t)((cr >> 3) | ((cg >> 3) << 5) | ((cb >> 3) << 10));
+            if (GOUR) { r += dr; g += dg; b += db; }
+        }
+        uint16_t* d = &drow[x & 1023];
+        if (c->check_mask && (*d & 0x8000)) continue;
+        if (semi) col = blend(*d, col, (int)c->semi_mode);
+        *d = col | c->set_bit;
+    }
+}
+
+/* Edge-function rasterizer, stepped per row and per pixel without divides
+ * (the SH4 has no integer divide; 64-bit divides cost hundreds of cycles).
+ * Edge values stay within 32 bits since coordinates are 11-bit. Colour and
+ * uv are 16.16 fixed point, stepped along the covered span of each row; the
+ * row start and the per-pixel step are set up in single-precision float,
+ * which the SH4 does in hardware. */
+static inline int floordiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }  /* b > 0 */
+
 static void triangle(const Shade* s, Vtx a, Vtx b, Vtx c)
 {
-    int64_t area = (int64_t)(b.x - a.x) * (c.y - a.y) - (int64_t)(b.y - a.y) * (c.x - a.x);
+    int area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     if (area == 0) return;
     if (area < 0) { Vtx t = b; b = c; c = t; area = -area; }
     /* the GPU drops polygons that span too far */
@@ -136,29 +206,58 @@ static void triangle(const Shade* s, Vtx a, Vtx b, Vtx c)
     miny = miny < G.clip_y0 ? G.clip_y0 : miny; maxy = maxy > G.clip_y1 ? G.clip_y1 : maxy;
     if (minx > maxx || miny > maxy) return;
 
-    /* edge e(p) = (q1 - q0) x (p - q0); top-left rule via bias */
-    #define EDGE(p0, p1, X, Y) ((int64_t)((p1).x - (p0).x) * ((Y) - (p0).y) - (int64_t)((p1).y - (p0).y) * ((X) - (p0).x))
-    #define BIAS(p0, p1) ((((p1).y == (p0).y && (p1).x < (p0).x) || (p1).y > (p0).y) ? 0 : -1)
-    int bias0 = BIAS(b, c), bias1 = BIAS(c, a), bias2 = BIAS(a, b);
-    for (int y = miny; y <= maxy; y++) {
-        for (int x = minx; x <= maxx; x++) {
-            int64_t w0 = EDGE(b, c, x, y), w1 = EDGE(c, a, x, y), w2 = EDGE(a, b, x, y);
-            if (w0 + bias0 < 0 || w1 + bias1 < 0 || w2 + bias2 < 0) continue;
-            int r, g, bl, u = 0, v = 0;
-            if (s->gouraud) {
-                r = (int)((w0 * a.r + w1 * b.r + w2 * c.r) / area);
-                g = (int)((w0 * a.g + w1 * b.g + w2 * c.g) / area);
-                bl = (int)((w0 * a.b + w1 * b.b + w2 * c.b) / area);
-            } else { r = a.r; g = a.g; bl = a.b; }
-            if (s->tex) {
-                u = (int)((w0 * a.u + w1 * b.u + w2 * c.u) / area);
-                v = (int)((w0 * a.v + w1 * b.v + w2 * c.v) / area);
-            }
-            shade_pixel(s, x, y, r, g, bl, u, v);
+    /* edge i: e(x,y) = (q1 - q0) x (p - q0) for edges bc, ca, ab; a pixel is
+     * inside when e >= t (t = 1 on edges that are not top-left) */
+    const Vtx* q0[3] = {&b, &c, &a};
+    const Vtx* q1[3] = {&c, &a, &b};
+    int e[3], kx[3], ky[3], t[3];
+    for (int i = 0; i < 3; i++) {
+        kx[i] = -(q1[i]->y - q0[i]->y);
+        ky[i] = q1[i]->x - q0[i]->x;
+        e[i] = ky[i] * (miny - q0[i]->y) + kx[i] * (minx - q0[i]->x);
+        t[i] = ((q1[i]->y == q0[i]->y && q1[i]->x < q0[i]->x) || q1[i]->y > q0[i]->y) ? 0 : 1;
+    }
+    /* attribute = (e0*A + e1*B + e2*C) / area */
+    const int na = s->tex ? 5 : 3;
+    const int gour = s->gouraud;
+    float A[5] = {(float)a.r, (float)a.g, (float)a.b, (float)a.u, (float)a.v};
+    float B[5] = {(float)b.r, (float)b.g, (float)b.b, (float)b.u, (float)b.v};
+    float C[5] = {(float)c.r, (float)c.g, (float)c.b, (float)c.u, (float)c.v};
+    float inv = 65536.0f / (float)area;
+    int32_t dx[5] = {0, 0, 0, 0, 0};
+    for (int k = 0; k < na; k++) {
+        float d = (A[k] * kx[0] + B[k] * kx[1] + C[k] * kx[2]) * inv;
+        dx[k] = d > 1073741824.0f ? 1073741824 : d < -1073741824.0f ? -1073741824 : (int32_t)d;
+    }
+    SpanCtx sc;
+    span_setup(&sc, s, a.r, a.g, a.b);
+    /* modulation is needed unless the texture is raw or the colour is a flat 128 */
+    int mod = s->tex && !s->raw && (gour || a.r != 128 || a.g != 128 || a.b != 128);
+    int mode = (s->tex ? 1 : 0) | (gour ? 2 : 0) | (s->semi ? 4 : 0) | (mod ? 8 : 0);
+    const int wmax = maxx - minx;
+    for (int y = miny; y <= maxy; y++, e[0] += ky[0], e[1] += ky[1], e[2] += ky[2]) {
+        int lo = 0, hi = wmax;
+        for (int i = 0; i < 3 && lo <= hi; i++) {
+            if (kx[i] > 0) { int n = -floordiv(e[i] - t[i], kx[i]); if (n > lo) lo = n; }
+            else if (kx[i] < 0) { int n = floordiv(e[i] - t[i], -kx[i]); if (n < hi) hi = n; }
+            else if (e[i] < t[i]) hi = -1;
+        }
+        if (lo > hi) continue;
+        float w0 = (float)(e[0] + kx[0] * lo), w1 = (float)(e[1] + kx[1] * lo), w2 = (float)(e[2] + kx[2] * lo);
+        int32_t at[5] = {0, 0, 0, 0, 0};
+        for (int k = 0; k < na; k++)
+            at[k] = (int32_t)((w0 * A[k] + w1 * B[k] + w2 * C[k]) * inv) + 16;    /* small bias against x.9999 from float rounding */
+        uint16_t* drow = &g_dc_vram[(y & 511) << 10];
+        int x0 = minx + lo, n = hi - lo + 1;
+        switch (mode) {
+#define SPAN(T, GO, SE, MO) case (T) | (GO) << 1 | (SE) << 2 | (MO) << 3: \
+            span(&sc, drow, x0, n, at, dx, T, GO, SE, MO); break;
+        SPAN(0,0,0,0) SPAN(0,1,0,0) SPAN(0,0,1,0) SPAN(0,1,1,0)
+        SPAN(1,0,0,0) SPAN(1,1,0,0) SPAN(1,0,1,0) SPAN(1,1,1,0)
+        SPAN(1,0,0,1) SPAN(1,1,0,1) SPAN(1,0,1,1) SPAN(1,1,1,1)
+#undef SPAN
         }
     }
-    #undef EDGE
-    #undef BIAS
 }
 
 static void polygon(const uint32_t* w)
