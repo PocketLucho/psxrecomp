@@ -6,8 +6,11 @@
  * 640x480 RGB555 framebuffer (pixel doubled; the PowerVR renderer comes later).
  *
  * File locations (first that opens wins):
- *   EXE:  /cd/PSX.EXE, /pc/PSX.EXE, /rd/PSX.EXE
- *   disc: /cd/DISC.BIN, /pc/DISC.BIN
+ *   EXE:  /hd/PSX.EXE, /cd/PSX.EXE, /pc/PSX.EXE, /rd/PSX.EXE
+ *   disc: /hd/DISC.BIN, /cd/DISC.BIN, /pc/DISC.BIN
+ * "/hd/" is the ISO9660 filesystem of the GD-ROM high-density area, read
+ * here directly: KallistiOS's /cd only mounts the low-density area of a
+ * GD-ROM (track 1), so on a GDI it only sees the small track-1 filesystem.
  */
 #include "dc_runtime.h"
 #include "dc_overlay.h"
@@ -17,6 +20,8 @@
 #include <dc/maple.h>
 #include <dc/maple/controller.h>
 #include <dc/video.h>
+#include <dc/cdrom.h>
+#include <dc/biosfont.h>
 #include <arch/timer.h>
 #include <arch/cache.h>
 #include <stdio.h>
@@ -27,12 +32,153 @@ KOS_INIT_FLAGS(INIT_DEFAULT);
 
 int dc_boot_exe(const void* exe, size_t size);
 
-void dc_host_log(const char* s) { dbgio_write_str(s); }
+/* ---- on-screen text ---------------------------------------------------- */
+/* Lines of log text drawn with the BIOS font until the PS1 picture takes over
+ * the framebuffer; a fatal error stays readable since nothing redraws then. */
+static int s_text_y = 16;
+static char s_line[96]; static int s_line_n;
+
+static void screen_line(const char* t)
+{
+    if (s_text_y + 24 > 480) { vid_clear(0, 0, 0); s_text_y = 16; }
+    char buf[56]; int n = 0;
+    for (; *t && n < 52; t++) buf[n++] = *t;
+    buf[n] = 0;
+    bfont_draw_str(vram_s + s_text_y * 640 + 12, 640, 1, buf);
+    s_text_y += 24;
+}
+
+void dc_host_log(const char* s)
+{
+    dbgio_write_str(s);
+    for (; *s; s++) {
+        if (*s == '\n' || s_line_n == (int)sizeof s_line - 1) {
+            s_line[s_line_n] = 0; screen_line(s_line); s_line_n = 0;
+            if (*s == '\n') continue;
+        }
+        if (*s != '\r') s_line[s_line_n++] = *s;
+    }
+}
+
+/* ---- GD-ROM high-density area ------------------------------------------ */
+/* Sectors are read in 32-sector chunks through a cache, which serves the
+ * 2352-byte disc-image sectors (they straddle 2048-byte sectors) and
+ * sequential reads with few drive commands. FADs are LBA + 150. */
+#define HD_CHUNK 32
+static uint8_t s_hd_buf[HD_CHUNK * 2048] __attribute__((aligned(32)));
+static uint32_t s_hd_buf_fad = 0xFFFFFFFFu;
+static uint32_t s_hd_root_fad, s_hd_root_size;
+static int s_hd_ok = -1;                       /* -1 untried, 0 no, 1 yes */
+static mutex_t s_hd_lock = MUTEX_INITIALIZER;
+
+static int hd_chunk(uint32_t fad)
+{
+    uint32_t base = fad - fad % HD_CHUNK;
+    if (base == s_hd_buf_fad) return 0;
+    s_hd_buf_fad = 0xFFFFFFFFu;
+    for (int tries = 0; tries < 3; tries++)
+        if (cdrom_read_sectors(s_hd_buf, base, HD_CHUNK) == ERR_OK) { s_hd_buf_fad = base; return 0; }
+    /* the chunk may run past the end of the disc: read sector by sector */
+    for (uint32_t i = 0; i < HD_CHUNK; i++)
+        if (cdrom_read_sectors(s_hd_buf + i * 2048, base + i, 1) != ERR_OK) {
+            if (base + i <= fad) return -1;
+            break;
+        }
+    s_hd_buf_fad = base;
+    return 0;
+}
+
+/* Read `len` bytes at byte offset `off` of the extent starting at `fad`. */
+static int hd_read(uint32_t fad, uint64_t off, void* out, uint32_t len)
+{
+    uint8_t* o = out;
+    mutex_lock(&s_hd_lock);
+    while (len) {
+        uint32_t sec = fad + (uint32_t)(off / 2048), in = (uint32_t)(off % 2048);
+        if (hd_chunk(sec)) { mutex_unlock(&s_hd_lock); return -1; }
+        uint32_t avail = (s_hd_buf_fad + HD_CHUNK - sec) * 2048 - in;
+        uint32_t n = len < avail ? len : avail;
+        memcpy(o, s_hd_buf + (sec - s_hd_buf_fad) * 2048 + in, n);
+        o += n; off += n; len -= n;
+    }
+    mutex_unlock(&s_hd_lock);
+    return 0;
+}
+
+static uint32_t le32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+static int hd_init(void)
+{
+    if (s_hd_ok >= 0) return s_hd_ok ? 0 : -1;
+    s_hd_ok = 0;
+    cd_toc_t toc;
+    if (cdrom_read_toc(&toc, true) != ERR_OK) return -1;   /* no high-density area: a CD */
+    uint32_t base = cdrom_locate_data_track(&toc);
+    if (!base) return -1;
+    uint8_t pvd[2048];
+    if (hd_read(base + 16, 0, pvd, 2048) || memcmp(pvd, "\001CD001", 6)) return -1;
+    s_hd_root_fad = le32(pvd + 156 + 2) + 150;
+    s_hd_root_size = le32(pvd + 156 + 10);
+    s_hd_ok = 1;
+    return 0;
+}
+
+static int name_eq(const uint8_t* iso, int n, const char* want, int wn)
+{
+    int k = 0;
+    while (k < n && iso[k] != ';') k++;
+    if (k && iso[k - 1] == '.') k--;
+    if (k != wn) return 0;
+    for (int i = 0; i < k; i++) {
+        char a = (char)iso[i], b = want[i];
+        if (a >= 'a' && a <= 'z') a -= 32;
+        if (b >= 'a' && b <= 'z') b -= 32;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* Find `path` (relative to the root, '/' separated). */
+static int hd_find(const char* path, uint32_t* fad, uint32_t* size)
+{
+    if (hd_init()) return -1;
+    uint32_t dfad = s_hd_root_fad, dsize = s_hd_root_size;
+    while (*path == '/') path++;
+    while (*path) {
+        const char* end = strchr(path, '/');
+        int wn = end ? (int)(end - path) : (int)strlen(path);
+        int found = 0;
+        for (uint32_t off = 0; off < dsize && !found; off += 2048) {
+            uint8_t sec[2048];
+            if (hd_read(dfad, off, sec, 2048)) return -1;
+            for (uint32_t p = 0; p < 2048 && sec[p]; p += sec[p]) {
+                const uint8_t* r = sec + p;
+                if (r[32] == 1 && (r[33] == 0 || r[33] == 1)) continue;
+                if (name_eq(r + 33, r[32], path, wn)) {
+                    dfad = le32(r + 2) + 150; dsize = le32(r + 10);
+                    found = 1; break;
+                }
+            }
+        }
+        if (!found) return -1;
+        if (!end) break;
+        path = end + 1;
+    }
+    *fad = dfad; *size = dsize;
+    return 0;
+}
 
 uint64_t dc_host_ticks_us(void) { return timer_us_gettime64(); }
 
 int dc_host_read_file(const char* path, void** data, size_t* size)
 {
+    if (!strncmp(path, "/hd/", 4)) {
+        uint32_t fad, n;
+        if (hd_find(path + 4, &fad, &n)) return -1;
+        void* p = malloc(n ? n : 1);
+        if (!p || hd_read(fad, 0, p, n)) { free(p); return -1; }
+        *data = p; *size = n; return 0;
+    }
     FILE* f = fopen(path, "rb"); if (!f) return -1;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     void* p = malloc((size_t)n);
@@ -42,9 +188,14 @@ int dc_host_read_file(const char* path, void** data, size_t* size)
 
 /* ---- disc ------------------------------------------------------------- */
 static file_t s_disc = FILEHND_INVALID;
+static uint32_t s_disc_fad, s_disc_size;    /* DISC.BIN in the high-density area */
 
 int dc_host_cd_read_sector(uint32_t lba, uint8_t* out)
 {
+    if (s_disc_fad) {
+        if ((uint64_t)(lba + 1) * 2352 > s_disc_size) return -1;
+        return hd_read(s_disc_fad, (uint64_t)lba * 2352, out, 2352);
+    }
     if (s_disc == FILEHND_INVALID) return -1;
     if (fs_seek(s_disc, (off_t)lba * 2352, SEEK_SET) < 0) return -1;
     return fs_read(s_disc, out, 2352) == 2352 ? 0 : -1;
@@ -53,6 +204,12 @@ int dc_host_cd_read_sector(uint32_t lba, uint8_t* out)
 /* ---- loadable overlays ---------------------------------------------- */
 int dc_host_load_overlay(const char* file, void* dst, uint32_t max)
 {
+    char hp[64]; snprintf(hp, sizeof hp, "OV/%s", file);
+    uint32_t fad, n;
+    if (hd_find(hp, &fad, &n) == 0) {
+        if (n > max) n = max;
+        return hd_read(fad, 0, dst, n) ? -1 : (int)n;
+    }
     static const char* const dirs[] = {"/cd/OV/", "/pc/OV/", "/rd/OV/", 0};
     for (int i = 0; dirs[i]; i++) {
         char path[128]; snprintf(path, sizeof path, "%s%s", dirs[i], file);
@@ -160,12 +317,12 @@ static int open_first(const char* const* paths, void** data, size_t* size, const
     return -1;
 }
 
-/* Boot steps are printed on screen (KOS debug output on the framebuffer) with
- * a pause after each, so a crash leaves the last step reached visible. The
- * PS1 picture replaces them once the game has run for a few seconds. */
+/* Boot steps are printed on screen with a pause after each, so a crash
+ * leaves the last step reached visible. The PS1 picture replaces them once
+ * the game has run for a few seconds. */
 static void step(const char* msg)
 {
-    dbglog(DBG_INFO, "%s\n", msg);
+    dc_host_log(msg); dc_host_log("\n");
     thd_sleep(700);
 }
 
@@ -185,19 +342,21 @@ int main(int argc, char** argv)
 {
     (void)argc; (void)argv;
     video_init();
-    dbgio_dev_select("fb");
     atexit(hang_at_exit);
     step("[xg] XenoTest Dreamcast - diagnostic boot");
     step("[xg] 1/5 KallistiOS and video ready");
-    static const char* const exe_paths[] = {"/cd/PSX.EXE", "/pc/PSX.EXE", "/rd/PSX.EXE", 0};
+    static const char* const exe_paths[] = {"/hd/PSX.EXE", "/cd/PSX.EXE", "/pc/PSX.EXE", "/rd/PSX.EXE", 0};
     static const char* const disc_paths[] = {"/cd/DISC.BIN", "/pc/DISC.BIN", 0};
     const char* used;
+    char msg[96];
     if (open_first(exe_paths, &s_exe, &s_exe_size, &used)) { step("[xg] ERROR: PSX.EXE not found"); return 1; }
-    dbglog(DBG_INFO, "[xg] 2/5 EXE %s (%u bytes)\n", used, (unsigned)s_exe_size);
-    thd_sleep(700);
-    for (int i = 0; disc_paths[i] && s_disc == FILEHND_INVALID; i++)
+    snprintf(msg, sizeof msg, "[xg] 2/5 EXE %s (%u bytes)", used, (unsigned)s_exe_size);
+    step(msg);
+    if (hd_find("DISC.BIN", &s_disc_fad, &s_disc_size)) s_disc_fad = 0;
+    for (int i = 0; disc_paths[i] && !s_disc_fad && s_disc == FILEHND_INVALID; i++)
         s_disc = fs_open(disc_paths[i], O_RDONLY);
-    step(s_disc == FILEHND_INVALID ? "[xg] 3/5 WARNING: DISC.BIN not found" : "[xg] 3/5 disc image open");
+    step(!s_disc_fad && s_disc == FILEHND_INVALID ? "[xg] 3/5 WARNING: DISC.BIN not found" :
+         s_disc_fad ? "[xg] 3/5 disc image open (GD-ROM)" : "[xg] 3/5 disc image open");
     uint8_t sec[2352];
     step(dc_host_cd_read_sector(16, sec) == 0 ? "[xg] 4/5 disc sector read ok" : "[xg] 4/5 ERROR: disc sector read failed");
     /* The kernel thread has a 64 KB stack; give the game 1 MB. */
