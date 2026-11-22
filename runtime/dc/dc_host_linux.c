@@ -42,6 +42,20 @@ int dc_host_cd_read_sector(uint32_t lba, uint8_t* out)
     return 0;
 }
 
+/* Loadable overlays: files in DC_OV_DIR (default "ov"). qemu notices code
+ * writes by itself, so nothing to flush. */
+int dc_host_load_overlay(const char* file, void* dst, uint32_t max)
+{
+    char path[512]; const char* dir = getenv("DC_OV_DIR");
+    snprintf(path, sizeof path, "%s/%s", dir ? dir : "ov", file);
+    FILE* f = fopen(path, "rb"); if (!f) return -1;
+    size_t n = fread(dst, 1, max, f);
+    fclose(f);
+    return (int)n;
+}
+
+void dc_host_code_written(void* p, uint32_t n) { (void)p; (void)n; }
+
 /* VBlank divider: 10 = 60 Hz. DC_VBLANK_DIV=1 gives 600 Hz, which keeps
  * PSY-Q's iteration-count timeouts from firing when qemu runs the guest much
  * faster than a PS1. */

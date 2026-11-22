@@ -9,7 +9,37 @@ extern const DcOverlay g_dc_overlays[] __attribute__((weak));
 extern const int g_dc_overlay_count __attribute__((weak));
 static int count(void) { return &g_dc_overlay_count ? g_dc_overlay_count : 0; }
 
+extern const DcOvSlot g_dc_ov_slots[] __attribute__((weak));
+extern const int g_dc_ov_slot_count __attribute__((weak));
+
 static const DcOverlay* s_last;      /* most recent match, checked first */
+static const DcOverlay* s_in_slot[16];                       /* overlay loaded in each slot */
+static int (*s_slot_fn[16])(CPUState*, uint32_t);            /* its dispatcher */
+
+/* Make sure a loadable overlay's code is in its slot; returns its dispatcher. */
+static int (*load(const DcOverlay* o))(CPUState*, uint32_t)
+{
+    if (o->dispatch) return o->dispatch;
+    int s = o->slot;
+    if (!&g_dc_ov_slot_count || s < 0 || s >= g_dc_ov_slot_count || s >= 16)
+        dc_fatal("overlay %s: no code slot %d", o->id, s);
+    if (s_in_slot[s] == o) return s_slot_fn[s];
+    const DcOvSlot* sl = &g_dc_ov_slots[s];
+    s_in_slot[s] = 0;
+    int n = dc_host_load_overlay(o->file, sl->base, sl->size);
+    const DcOvHeader* h = (const DcOvHeader*)sl->base;
+    uint32_t base = (uint32_t)(uintptr_t)sl->base;
+    if (n < (int)sizeof *h || h->magic != DC_OV_MAGIC || h->end < base + (uint32_t)n || h->end > base + sl->size)
+        dc_fatal("overlay %s: cannot load %s into slot %d (%d bytes)", o->id, o->file, s, n);
+    memset(sl->base + n, 0, h->end - base - (uint32_t)n);
+    dc_host_code_written(sl->base, h->end - base);
+    s_slot_fn[s] = (int (*)(CPUState*, uint32_t))(uintptr_t)h->dispatch;
+    s_in_slot[s] = o;
+    char b[128];
+    snprintf(b, sizeof b, "[overlay] loaded %s (%d bytes) into slot %d\n", o->file, n, s);
+    dc_host_log(b);
+    return s_slot_fn[s];
+}
 static const DcOverlay* s_logged[8]; /* overlays already reported as resident */
 
 static struct { char id[48]; uint32_t addr; DcSkipFn fn; } s_skip[8];
@@ -73,13 +103,13 @@ static int covers(const DcOverlay* o, uint32_t a)
 int dc_overlay_dispatch(CPUState* cpu, uint32_t addr)
 {
     if (s_last && covers(s_last, addr) && resident(s_last)) {
-        if (skipped(cpu, s_last, addr) || s_last->dispatch(cpu, addr)) return 1;
+        if (skipped(cpu, s_last, addr) || load(s_last)(cpu, addr)) return 1;
     }
     for (int i = 0; i < count(); i++) {
         const DcOverlay* o = &g_dc_overlays[i];
         if (o == s_last || !covers(o, addr) || !resident(o)) continue;
         if (skipped(cpu, o, addr)) return 1;
-        if (!o->dispatch(cpu, addr)) continue;
+        if (!load(o)(cpu, addr)) continue;
         int seen = 0, k;
         for (k = 0; k < 8; k++) if (s_logged[k] == o) seen = 1;
         if (!seen) {

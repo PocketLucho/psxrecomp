@@ -84,3 +84,8 @@ uint16_t dc_host_pad_buttons(int port);
 void dc_host_vblank(void);
 /* Read one raw 2352-byte sector (LBA from the start of the data track); 0 on success. */
 int  dc_host_cd_read_sector(uint32_t lba, uint8_t* out2352);
+/* Load a compiled-overlay file into dst (at most max bytes); returns the size
+ * read or -1. Then dc_host_code_written makes the new code visible to the
+ * instruction fetch (cache flush on hardware). */
+int  dc_host_load_overlay(const char* file, void* dst, uint32_t max);
+void dc_host_code_written(void* p, uint32_t n);

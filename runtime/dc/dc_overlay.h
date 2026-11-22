@@ -16,7 +16,21 @@ typedef struct {
     int nsamples;
     struct { uint32_t addr, word; } samples[DC_OVERLAY_SAMPLES];
     int (*dispatch)(CPUState* cpu, uint32_t addr);
+    /* Loadable overlays (dispatch == NULL): compiled code kept in a file and
+     * loaded on demand into code slot `slot` (see DcOvSlot). */
+    const char* file;
+    int slot;
 } DcOverlay;
+
+/* A region of host memory that holds one loadable overlay's code at a time.
+ * Overlays that the game loads at the same PS1 address share a slot, since
+ * they can never be resident together. A loaded file starts with
+ * DcOvHeader; the bytes after the file up to header.end are zeroed (bss). */
+typedef struct { uint8_t* base; uint32_t size; } DcOvSlot;
+#define DC_OV_MAGIC 0x564F4758u   /* "XGOV" */
+typedef struct { uint32_t magic, dispatch, end, reserved; } DcOvHeader;
+extern const DcOvSlot g_dc_ov_slots[];
+extern const int g_dc_ov_slot_count;
 
 /* Provided by the game's generated registry (optional, referenced weakly). */
 extern const DcOverlay g_dc_overlays[];
