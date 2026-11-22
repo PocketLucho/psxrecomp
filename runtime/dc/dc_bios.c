@@ -23,6 +23,8 @@ typedef struct { uint32_t cls, spec, mode, func, enabled, ready, used; } DcEvent
 static DcEvent s_ev[DC_MAX_EVENTS];
 
 /* ---- interrupt handler chains (SysEnqIntRP) and hook ---- */
+static uint32_t s_pad_buf[2], s_pad_siz[2];
+static int s_pad_on;
 static uint32_t s_intrp[4];        /* head of each priority chain (guest address) */
 static uint32_t s_hook;            /* HookEntryInt jmp_buf, 0 = none */
 static int s_hook_active;
@@ -128,10 +130,26 @@ static void ev_deliver(CPUState* cpu, uint32_t cls, uint32_t spec)
 }
 
 /* ---- interrupt delivery: handler chains, then the PSY-Q hook ---- */
+/* BIOS pad buffers (InitPad/StartPad): filled at every VBlank, as the real
+ * BIOS does, with a digital pad on each port. Byte 0: 0x00 = connected,
+ * byte 1: 0x41 = digital pad, bytes 2-3: buttons, active low. */
+static void pad_update(void)
+{
+    if (!s_pad_on) return;
+    for (int port = 0; port < 2; port++) {
+        uint32_t b = s_pad_buf[port];
+        if (!b || s_pad_siz[port] < 4) continue;
+        uint16_t keys = (uint16_t)~dc_host_pad_buttons(port);
+        if (port == 1) { dc_write8(b, 0xFF); continue; }   /* nothing in port 2 */
+        dc_write8(b + 0, 0x00); dc_write8(b + 1, 0x41);
+        dc_write8(b + 2, (uint8_t)keys); dc_write8(b + 3, (uint8_t)(keys >> 8));
+    }
+}
+
 void dc_bios_interrupt(CPUState* cpu)
 {
     uint32_t pending = dc_io_istat() & dc_io_imask();
-    if (pending & 1u) g_dc_stats.vblanks++;
+    if (pending & 1u) { g_dc_stats.vblanks++; pad_update(); }
     for (int pr = 0; pr < 4; pr++) {
         for (uint32_t q = s_intrp[pr], guard = 0; q && guard < 16; q = rd(q), guard++) {
             uint32_t func2 = rd(q + 4), func1 = rd(q + 8);
@@ -198,7 +216,10 @@ static void bios_b0(CPUState* cpu, uint32_t fn)
     case 0x0B: { DcEvent* e = ev_get(A0); V0 = (e && e->ready) ? 1 : 0; if (e) e->ready = 0; break; }
     case 0x0C: { DcEvent* e = ev_get(A0); if (e) e->enabled = 1; V0 = 1; break; }
     case 0x0D: { DcEvent* e = ev_get(A0); if (e) e->enabled = 0; V0 = 1; break; }
-    case 0x12: case 0x13: case 0x14: V0 = 1; break;     /* InitPad/StartPad/StopPad */
+    case 0x12:                                          /* InitPad(buf1, siz1, buf2, siz2) */
+        s_pad_buf[0] = A0; s_pad_siz[0] = A1; s_pad_buf[1] = A2; s_pad_siz[1] = A3; V0 = 1; break;
+    case 0x13: s_pad_on = 1; V0 = 1; break;             /* StartPad */
+    case 0x14: s_pad_on = 0; V0 = 1; break;             /* StopPad */
     case 0x17:                                          /* ReturnFromException */
         if (s_hook_active) dc_request_stop();
         else dc_fatal("ReturnFromException outside an interrupt");

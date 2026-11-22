@@ -40,11 +40,15 @@ static void profile_dump(void)
 /* Last dispatched guest addresses, printed by dc_fatal. */
 static uint32_t s_ring[16]; static unsigned s_ring_pos;
 
+static int s_in_irq_dbg(void);
 void dc_fatal(const char* fmt, ...)
 {
     char b[256];
     va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
     dc_host_log("[fatal] "); dc_host_log(b); dc_host_log("\n");
+    { extern void dc_cd_debug(char*, unsigned); dc_cd_debug(b, sizeof b); dc_host_log(b); }
+    snprintf(b, sizeof b, "[irq-state] in_irq=%d enabled=%d\n", s_in_irq_dbg(), dc_bios_irq_enabled());
+    dc_host_log(b);
     snprintf(b, sizeof b,
              "[stats] dispatches=%llu bios=%llu syscalls=%llu irqs=%llu vblanks=%llu "
              "gp0=%llu gp1=%llu gpu_dma=%llu cd_cmds=%llu gte=%llu last=%08X\n",
@@ -67,12 +71,19 @@ void dc_fatal(const char* fmt, ...)
 
 /* ---- interrupts -------------------------------------------------------- */
 static int s_in_irq;
+static int s_in_irq_dbg(void) { return s_in_irq; }
 
 static void deliver_irq(CPUState* cpu)
 {
     g_irq_pending = 0;
+    /* Nothing new is raised while the guest's handler runs. Under a slow host
+     * the handler can take longer than one CD sector period of host time, and
+     * libcd's handler loops while the CD has an interrupt pending, so a sector
+     * arriving mid-handler kept it from ever returning. VBlanks are not lost:
+     * the host keeps counting them until the next poll. */
+    if (s_in_irq) return;
     dc_io_poll();
-    if (s_in_irq || !dc_bios_irq_enabled()) return;
+    if (!dc_bios_irq_enabled()) return;
     if (!(dc_io_istat() & dc_io_imask())) return;
     g_dc_stats.irqs++;
     CPUState saved = *cpu;

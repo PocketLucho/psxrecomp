@@ -82,6 +82,7 @@ void dc_host_start_vblank_timer(void)
 /* Frame dumps for testing: DC_FRAME_DIR=dir writes the display area as PPM
  * every DC_FRAME_EVERY VBlanks (default 60); DC_FRAME_VRAM=1 writes the
  * whole 1024x512 VRAM instead. */
+static unsigned s_vbl_count;   /* VBlanks presented so far */
 static const char* s_frame_dir;
 static int s_frame_every = 60, s_frame_vram;
 
@@ -111,19 +112,57 @@ static void write_ppm(const char* path, int x0, int y0, int w, int h, int depth2
 void dc_host_vblank(void)
 {
     static unsigned n, k;
+    s_vbl_count++;
     if (!s_frame_dir || ++n % (unsigned)s_frame_every) return;
     char path[512];
     snprintf(path, sizeof path, "%s/frame_%05u.ppm", s_frame_dir, k++);
     if (s_frame_vram) { write_ppm(path, 0, 0, 1024, 512, 0); return; }
     DcGpuDisplay d; dc_gpu_display(&d);
     if (getenv("DC_FRAME_INFO")) {
-        fprintf(stdout, "[frame] %u display %d,%d %dx%d depth24=%d enabled=%d\n", k - 1, d.x, d.y, d.w, d.h,
+        fprintf(stdout, "[frame] %u vblank %u display %d,%d %dx%d depth24=%d enabled=%d\n", k - 1, s_vbl_count, d.x, d.y, d.w, d.h,
                 d.depth24, d.enabled);
     }
     write_ppm(path, d.x, d.y, d.w, d.h, d.depth24);
 }
 
-static void on_timeout(int sig) { (void)sig; dc_fatal("time limit reached"); }
+/* Scripted pad for tests: DC_PAD="from-to:mask[,from-to:mask...]" holds the
+ * buttons in hex mask (PS1 bit order, 0008 = Start, 4000 = Cross) on port 0
+ * from VBlank `from` to VBlank `to`. */
+static struct { unsigned from, to; uint16_t mask; } s_pad[32];
+static int s_npad;
+
+uint16_t dc_host_pad_buttons(int port)
+{
+    if (port) return 0;
+    uint16_t m = 0;
+    for (int i = 0; i < s_npad; i++)
+        if (s_vbl_count >= s_pad[i].from && s_vbl_count <= s_pad[i].to) m |= s_pad[i].mask;
+    return m;
+}
+
+static void pad_parse(const char* p)
+{
+    while (p && *p && s_npad < 32) {
+        unsigned a, b, m; int n = 0;
+        if (sscanf(p, "%u-%u:%x%n", &a, &b, &m, &n) != 3) break;
+        s_pad[s_npad].from = a; s_pad[s_npad].to = b; s_pad[s_npad].mask = (uint16_t)m; s_npad++;
+        p += n; if (*p == ',') p++;
+    }
+}
+
+/* DC_PEEK=addr,addr,...: words to print when the time limit stops the run */
+static void peek_dump(void)
+{
+    const char* p = getenv("DC_PEEK");
+    while (p && *p) {
+        char* e; unsigned long a = strtoul(p, &e, 16);
+        if (e == p) break;
+        char b[48]; snprintf(b, sizeof b, "[peek] %08lX = %08X\n", a, (unsigned)dc_read32((uint32_t)a));
+        dc_host_log(b);
+        p = *e == ',' ? e + 1 : e;
+    }
+}
+static void on_timeout(int sig) { (void)sig; peek_dump(); dc_fatal("time limit reached"); }
 static void on_segv(int sig, siginfo_t* si, void* uc)
 {
     (void)sig; int here;
@@ -150,6 +189,7 @@ int main(int argc, char** argv)
     sa.sa_sigaction = on_segv; sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0);
     if (getenv("DC_VBLANK_DIV")) s_vblank_div = atoi(getenv("DC_VBLANK_DIV")) > 0 ? atoi(getenv("DC_VBLANK_DIV")) : 10;
+    pad_parse(getenv("DC_PAD"));
     s_frame_dir = getenv("DC_FRAME_DIR");
     if (getenv("DC_FRAME_EVERY")) s_frame_every = atoi(getenv("DC_FRAME_EVERY")) > 0 ? atoi(getenv("DC_FRAME_EVERY")) : 60;
     s_frame_vram = getenv("DC_FRAME_VRAM") != 0;

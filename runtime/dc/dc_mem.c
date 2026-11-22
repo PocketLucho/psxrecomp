@@ -203,6 +203,13 @@ static void cd_ack(uint8_t bits)
 /* Called from the interrupt path: deliver the next sector of a running read
  * once the drive would have it (75 sectors/s, 150 at double speed). */
 static uint64_t s_cd_next_us;
+void dc_cd_debug(char* b, unsigned n)
+{
+    snprintf(b, n, "[cd-state] if=%02X ie=%02X reading=%d npend=%d ready=%d lba=%u mode=%02X istat=%03X imask=%03X\n",
+             s_cd_if, s_cd_ie, s_cd_reading, s_cd_npend, s_cd_sector_ready, (unsigned)s_cd_lba,
+             (unsigned)s_cd_mode, (unsigned)dc_io_istat(), (unsigned)dc_io_imask());
+}
+
 void dc_io_poll(void)
 {
     if (dc_host_take_vblanks()) { dc_irq_raise(1u); dc_host_vblank(); }

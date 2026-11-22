@@ -43,6 +43,15 @@ iteration-count timeouts (for example in `VSync`) fire before a 60 Hz VBlank;
 VBlanks (default 60); `DC_FRAME_VRAM=1` writes the whole VRAM instead and
 `DC_FRAME_INFO=1` logs the display mode of each dump.
 
+Controller: the BIOS pad buffers (InitPad/StartPad) are filled on every
+VBlank as a digital pad in port 1. Under Linux the buttons come from a script,
+`DC_PAD="from-to:mask,..."`, where `from`/`to` are VBlank numbers and `mask`
+is the pressed buttons in hex, in the order of the pad's bytes 2-3:
+Select 0001, Start 0008, Up 0010, Right 0020, Down 0040, Left 0080,
+L2 0100, R2 0200, L1 0400, R1 0800, Triangle 1000, Circle 2000,
+Cross 4000, Square 8000. Example: `DC_PAD="4500-4530:4000,5600-5630:0010"`.
+On a fatal stop the runtime also prints the CD controller and interrupt state.
+
 ## Overlays
 
 Each overlay is compiled on its own with `psxrecomp-game --overlay --target dc`.

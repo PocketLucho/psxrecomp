@@ -78,6 +78,8 @@ void dc_host_start_vblank_timer(void);
  * them and sets g_irq_pending; the core raises the interrupt from dc_io_poll,
  * so device state is touched by the guest thread alone. */
 unsigned dc_host_take_vblanks(void);
+/* Pad buttons on port 0/1, active high, PS1 bit order (bit 3 Start, 14 Cross...). */
+uint16_t dc_host_pad_buttons(int port);
 /* Called on the guest thread at each delivered VBlank: present a frame. */
 void dc_host_vblank(void);
 /* Read one raw 2352-byte sector (LBA from the start of the data track); 0 on success. */
