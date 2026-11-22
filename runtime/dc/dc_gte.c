@@ -7,6 +7,7 @@
  */
 #include "dc_runtime.h"
 #include "psx_gte_divide.h"
+#include <string.h>
 
 #define D(i) cpu->gte_data[i]
 #define C(i) cpu->gte_ctrl[i]
@@ -133,6 +134,23 @@ static void push_rgb(CPUState* cpu, Op* o)
 /* MAC = T*0x1000 + M*V ; then IR from MAC. */
 static void mul_mv(CPUState* cpu, Op* o, int16_t m[3][3], const int32_t v[3], const int64_t t[3])
 {
+    /* |M| <= 2^13, |V| <= 2^15 (16-bit), |T| < 2^17: the sum stays under
+       2^31, so 32-bit arithmetic is exact and no MAC overflow is possible.
+       Light and colour matrices (1.0 = 0x1000) usually qualify. */
+    int small = (uint32_t)(v[0] + 0x8000) <= 0xFFFF && (uint32_t)(v[1] + 0x8000) <= 0xFFFF &&
+                (uint32_t)(v[2] + 0x8000) <= 0xFFFF;
+    for (int i = 0; i < 3 && small; i++) {
+        if ((uint64_t)(t[i] + 0x20000) >= 0x40000) small = 0;
+        for (int j = 0; j < 3; j++) if ((uint32_t)(m[i][j] + 0x2000) > 0x4000) small = 0;
+    }
+    if (small) {
+        for (int i = 0; i < 3; i++) {
+            int32_t a = ((int32_t)t[i] << 12) + m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2];
+            D(25 + i) = (uint32_t)(a >> o->sf);
+        }
+        macs_to_ir(cpu, o);
+        return;
+    }
     for (int i = 0; i < 3; i++) {
         int64_t a = mac_chk(o, i + 1, t[i] * 0x1000 + (int64_t)m[i][0] * v[0]);
         a = mac_chk(o, i + 1, a + (int64_t)m[i][1] * v[1]);
@@ -151,6 +169,28 @@ static inline int64_t mac_fast(Op* o, int i, int64_t v)
     if ((uint64_t)(v + 0x80000000000LL) >> 44) return mac_chk(o, i, v);
     return v;
 }
+/* Perspective divide results for the current projection distance H, filled
+   as depths come up (bit 31: known, bit 30: overflow). Reset when H changes. */
+static uint32_t s_div[0x10000];
+static uint16_t s_div_h;
+static int s_div_ok;
+static inline uint32_t gte_div(uint16_t h, uint16_t z, int* overflow)
+{
+    if (__builtin_expect(h != s_div_h || !s_div_ok, 0)) {
+        memset(s_div, 0, sizeof s_div);
+        s_div_h = h; s_div_ok = 1;
+    }
+    uint32_t e = s_div[z];
+    if (__builtin_expect(!(e & 0x80000000u), 0)) {
+        int ov = 0;
+        uint32_t q = (uint32_t)psx_gte_divide(h, z, &ov);
+        e = 0x80000000u | (ov ? 0x40000000u : 0) | q;
+        s_div[z] = e;
+    }
+    *overflow = (e >> 30) & 1;
+    return e & 0x3FFFFFFFu;
+}
+
 static void rtp_m(CPUState* cpu, Op* o, const int16_t m[3][3], const int64_t t12[3], int small_t, int n, int last)
 {
     const int32_t v0 = lo16(D(n * 2)), v1 = hi16(D(n * 2)), v2 = lo16(D(n * 2 + 1));
@@ -183,7 +223,7 @@ static void rtp_m(CPUState* cpu, Op* o, const int16_t m[3][3], const int64_t t12
     uint16_t z = sat_z(o, mac[2] >> 12);
     push_sz(cpu, z);
     int overflow = 0;
-    uint32_t q = (uint32_t)psx_gte_divide((uint16_t)C(26), z, &overflow);
+    uint32_t q = gte_div((uint16_t)C(26), z, &overflow);
     if (overflow) o->flag |= F_DIV;
     int64_t sx = (int64_t)q * ir(cpu, 1) + (int32_t)C(24);
     int64_t sy = (int64_t)q * ir(cpu, 2) + (int32_t)C(25);

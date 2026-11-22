@@ -10,8 +10,8 @@
  *   order, no depth test).
  * - 4-bit texture pages become paletted PowerVR textures (one twiddled page
  *   per VRAM page, CLUTs in the 64 palette banks). 8-bit and 15-bit pages
- *   are converted per (page, CLUT) to ARGB1555 in 16-row bands as they are
- *   needed. Colour 0 is transparent. Everything is checked against VRAM
+ *   are converted per (page, CLUT) to ARGB1555 in 16x16-texel cells as
+ *   they are needed. Colour 0 is transparent. Everything is checked against VRAM
  *   write generations, so uploads and CLUT changes are seen.
  * - Texture windows are converted as small repeating textures.
  * - Semi-transparency: average = alpha 0.5, add = ONE, subtract is
@@ -68,7 +68,7 @@ static unsigned s_rtt_idle;         /* frames since one read itself */
 /* ---- texture cache ------------------------------------------------------ */
 #define NTEX 24            /* at most; as many as fit in video memory */
 static int s_ntex;
-typedef struct { uint32_t key, win, stamp, used, bands; pvr_ptr_t tex; } TexEnt;
+typedef struct { uint32_t key, win, stamp, used; uint16_t cells[16]; pvr_ptr_t tex; } TexEnt;
 static TexEnt s_tex[NTEX];
 static uint16_t s_conv[256 * 256] __attribute__((aligned(32)));
 static uint16_t s_clut[256];
@@ -100,7 +100,7 @@ static uint32_t stamp_of(int x, int w, int y, int h)
 
 /* Convert rows y0..y1-1 of a full page (window-less), or the whole texture
    for texture windows and VRAM blits. */
-static void convert(const DcPrim* p, int y0, int y1)
+static void convert(const DcPrim* p, int y0, int y1, int x0, int x1)
 {
     if (p->depth == 3) {            /* VRAM as is, opaque (copies and uploads) */
         uint16_t* o = s_conv;
@@ -132,25 +132,46 @@ static void convert(const DcPrim* p, int y0, int y1)
         }
         return;
     }
-    uint16_t* o = s_conv + y0 * 256;
     for (int v = y0; v < y1; v++) {
         const uint16_t* row = &g_dc_vram[((p->tp_y + (uint32_t)v) & 511) << 10];
+        uint16_t* o = s_conv + v * 256 + x0;
         if (depth == 0) {
-            for (int u = 0; u < 256; u += 4) {
+            for (int u = x0; u < x1; u += 4) {
                 uint16_t w = row[(p->tp_x + (uint32_t)(u >> 2)) & 1023];
                 o[0] = s_clut[w & 15]; o[1] = s_clut[(w >> 4) & 15];
                 o[2] = s_clut[(w >> 8) & 15]; o[3] = s_clut[w >> 12];
                 o += 4;
             }
         } else if (depth == 1) {
-            for (int u = 0; u < 256; u += 2) {
+            for (int u = x0; u < x1; u += 2) {
                 uint16_t w = row[(p->tp_x + (uint32_t)(u >> 1)) & 1023];
                 o[0] = s_clut[w & 255]; o[1] = s_clut[w >> 8];
                 o += 2;
             }
         } else {
-            for (int u = 0; u < 256; u++) *o++ = to1555(row[(p->tp_x + (uint32_t)u) & 1023]);
+            for (int u = x0; u < x1; u++) *o++ = to1555(row[(p->tp_x + (uint32_t)u) & 1023]);
         }
+    }
+}
+
+/* Convert and upload the 16x16-texel cells of band b set in cols. */
+static void fill_cells(TexEnt* e, const DcPrim* p, int b, uint32_t cols)
+{
+    for (int c = 0; c < 16;) {
+        if (!(cols >> c & 1)) { c++; continue; }
+        int c1 = c;
+        while (c1 + 1 < 16 && (cols >> (c1 + 1) & 1)) c1++;
+        int x0 = c * 16, x1 = (c1 + 1) * 16;
+        convert(p, b * 16, b * 16 + 16, x0, x1);
+        for (int y = b * 16; y < b * 16 + 16; y++) {
+            uint32_t* d = (uint32_t*)e->tex + (y * 256 + x0) / 2;
+            const uint32_t* sr = (const uint32_t*)s_conv + (y * 256 + x0) / 2;
+            for (int j = 0; j < (x1 - x0) / 2; j += 8) {
+                d[j] = sr[j]; d[j + 1] = sr[j + 1]; d[j + 2] = sr[j + 2]; d[j + 3] = sr[j + 3];
+                d[j + 4] = sr[j + 4]; d[j + 5] = sr[j + 5]; d[j + 6] = sr[j + 6]; d[j + 7] = sr[j + 7];
+            }
+        }
+        c = c1 + 1;
     }
 }
 
@@ -169,14 +190,20 @@ static pvr_ptr_t texture_for(const DcPrim* p)
     if (depth < 2) st = st * 31u + stamp_of((int)p->clut_x, depth == 0 ? 16 : 256, (int)p->clut_y, 1);
     const uint32_t win = depth == 3 ? 0 : (uint32_t)(win_w(p) & 511) | (uint32_t)(win_h(p) & 511) << 9 |
                          (uint32_t)(p->tw_u0 & 255) << 18 | (uint32_t)(p->tw_v0 & 63) << 26;
-    /* full pages are converted in bands of 16 rows, as primitives need them */
+    /* full pages are converted in cells of 16x16 texels, as primitives need them */
     const int banded = depth != 3 && win_w(p) == 256 && win_h(p) == 256;
-    uint32_t need = 0xFFFF;
+    int b0 = 0, b1 = 15;
+    uint32_t cols = 0xFFFF;
     if (banded) {
-        int v0 = p->v[0].v, v1 = v0;
-        for (int k = 1; k < p->n; k++) { v0 = p->v[k].v < v0 ? p->v[k].v : v0; v1 = p->v[k].v > v1 ? p->v[k].v : v1; }
+        int u0 = p->v[0].u, u1 = u0, v0 = p->v[0].v, v1 = v0;
+        for (int k = 1; k < p->n; k++) {
+            u0 = p->v[k].u < u0 ? p->v[k].u : u0; u1 = p->v[k].u > u1 ? p->v[k].u : u1;
+            v0 = p->v[k].v < v0 ? p->v[k].v : v0; v1 = p->v[k].v > v1 ? p->v[k].v : v1;
+        }
+        u0 = u0 < 0 ? 0 : u0 > 255 ? 255 : u0; u1 = u1 < 0 ? 0 : u1 > 255 ? 255 : u1;
         v0 = v0 < 0 ? 0 : v0 > 255 ? 255 : v0; v1 = v1 < 0 ? 0 : v1 > 255 ? 255 : v1;
-        need = (0xFFFFu >> (15 - (v1 >> 4))) & (0xFFFFu << (v0 >> 4));
+        b0 = v0 >> 4; b1 = v1 >> 4;
+        cols = (0xFFFFu >> (15 - (u1 >> 4))) & (0xFFFFu << (u0 >> 4));
     }
     int victim = -1;
     for (int i = 0; i < s_ntex; i++) {
@@ -184,22 +211,19 @@ static pvr_ptr_t texture_for(const DcPrim* p)
         if (e->key == key && e->win == win) {
             e->used = s_frame;
             if (e->stamp == st) {
-                uint32_t miss = need & ~e->bands;
-                if (!miss) return e->tex;
-                /* rows not drawn from before: safe to add while in use */
-                for (int b = 0; b < 16; b++) if (miss >> b & 1) {
-                    convert(p, b * 16, b * 16 + 16);
-                    uint32_t* d = (uint32_t*)e->tex + b * 16 * 128;
-                    const uint32_t* sr = (const uint32_t*)s_conv + b * 16 * 128;
-                    for (int j = 0; j < 16 * 128; j += 4) { d[j] = sr[j]; d[j + 1] = sr[j + 1]; d[j + 2] = sr[j + 2]; d[j + 3] = sr[j + 3]; }
+                /* cells not drawn from before: safe to add while in use */
+                for (int b = b0; b <= b1; b++) {
+                    uint32_t miss = cols & ~(uint32_t)e->cells[b];
+                    if (!miss) continue;
+                    fill_cells(e, p, b, miss);
+                    e->cells[b] |= (uint16_t)miss;
                 }
-                e->bands |= miss;
-#ifdef DC_PVR_TEXSTAT
-                s_tstat[depth][1]++;
-#endif
                 return e->tex;
             }
             victim = i;                 /* same page, VRAM changed: refresh */
+#ifdef DC_PVR_TEXSTAT
+            { static int n; if (n < 30 && depth == 2) { n++; char b[96]; snprintf(b, sizeof b, "[t15] refresh tp=%u,%u frame %u\n", p->tp_x, p->tp_y, s_frame); dbgio_write_str(b); } }
+#endif
             break;
         }
         /* oldest entry not used in this or the previous frame (the PowerVR
@@ -217,20 +241,17 @@ static pvr_ptr_t texture_for(const DcPrim* p)
     TexEnt* e = &s_tex[victim];
     /* plain CPU copy: the store queues are busy feeding the TA */
     if (banded) {
-        for (int b = 0; b < 16; b++) if (need >> b & 1) {
-            convert(p, b * 16, b * 16 + 16);
-            uint32_t* d = (uint32_t*)e->tex + b * 16 * 128;
-            const uint32_t* sr = (const uint32_t*)s_conv + b * 16 * 128;
-            for (int j = 0; j < 16 * 128; j += 4) { d[j] = sr[j]; d[j + 1] = sr[j + 1]; d[j + 2] = sr[j + 2]; d[j + 3] = sr[j + 3]; }
-        }
+        memset(e->cells, 0, sizeof e->cells);
+        for (int b = b0; b <= b1; b++) { fill_cells(e, p, b, cols); e->cells[b] = (uint16_t)cols; }
     } else {
-        convert(p, 0, 256);
+        convert(p, 0, 256, 0, 256);
         uint32_t* d = (uint32_t*)e->tex;
         const uint32_t* s = (const uint32_t*)s_conv;
         const int words = depth == 3 ? 256 * 256 / 2 : win_w(p) * win_h(p) / 2;
         for (int i = 0; i < words; i += 4) { d[i] = s[i]; d[i + 1] = s[i + 1]; d[i + 2] = s[i + 2]; d[i + 3] = s[i + 3]; }
     }
-    e->key = key; e->win = win; e->stamp = st; e->used = s_frame; e->bands = banded ? need : 0xFFFF;
+    if (!banded) memset(e->cells, 0xFF, sizeof e->cells);
+    e->key = key; e->win = win; e->stamp = st; e->used = s_frame;
     return e->tex;
 }
 

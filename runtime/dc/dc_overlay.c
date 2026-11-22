@@ -85,11 +85,14 @@ static int skipped(CPUState* cpu, const DcOverlay* o, uint32_t addr)
     return 0;
 }
 
+/* Runs at every call into overlay code: sample words are code words, so
+   aligned, and read directly (a memcpy call per word cost ~5% of a frame). */
 static int resident(const DcOverlay* o)
 {
     for (int i = 0; i < o->nsamples; i++) {
-        uint32_t w;
-        memcpy(&w, dc_ram_ptr(o->samples[i].addr), 4);
+        uint32_t a = o->samples[i].addr, w;
+        if (__builtin_expect(!(a & 3), 1)) w = *(const uint32_t*)(const void*)dc_ram_ptr(a);
+        else memcpy(&w, dc_ram_ptr(a), 4);
         if (w != o->samples[i].word) return 0;
     }
     return 1;
@@ -100,9 +103,25 @@ static int covers(const DcOverlay* o, uint32_t a)
     return dc_phys(a) - dc_phys(o->load) < o->size;
 }
 
+/* The overlay that ran last is checked at three of its sample words only:
+   one loaded over it at the same place differs there too. */
+static int still_resident(const DcOverlay* o)
+{
+    int n = o->nsamples;
+    if (n < 4) return resident(o);
+    const int k[3] = { 0, n / 2, n - 1 };
+    for (int i = 0; i < 3; i++) {
+        uint32_t a = o->samples[k[i]].addr, w;
+        if (a & 3) return resident(o);
+        w = *(const uint32_t*)(const void*)dc_ram_ptr(a);
+        if (w != o->samples[k[i]].word) return 0;
+    }
+    return 1;
+}
+
 int dc_overlay_dispatch(CPUState* cpu, uint32_t addr)
 {
-    if (s_last && covers(s_last, addr) && resident(s_last)) {
+    if (s_last && covers(s_last, addr) && still_resident(s_last)) {
         if (skipped(cpu, s_last, addr) || load(s_last)(cpu, addr)) return 1;
     }
     for (int i = 0; i < count(); i++) {
