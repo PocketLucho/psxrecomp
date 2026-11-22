@@ -142,17 +142,31 @@ static void mul_mv(CPUState* cpu, Op* o, int16_t m[3][3], const int32_t v[3], co
     macs_to_ir(cpu, o);
 }
 
-/* ---- perspective transform of one vertex ---- */
-static void rtp(CPUState* cpu, Op* o, int n, int last)
+/* ---- perspective transform of one vertex ----
+   The rotation matrix and translation are unpacked once per command (RTPT
+   does three vertices). The 44-bit accumulator is checked once, after the
+   last addition: the 16x16-bit products cannot overflow on their own. */
+static inline int64_t mac_fast(Op* o, int i, int64_t v)
 {
-    int16_t m[3][3], v16[3];
-    mat(cpu, 0, m); vec(cpu, n, v16);
-    int64_t t[3] = { (int32_t)C(5), (int32_t)C(6), (int32_t)C(7) };
+    if ((uint64_t)(v + 0x80000000000LL) >> 44) return mac_chk(o, i, v);
+    return v;
+}
+static void rtp_m(CPUState* cpu, Op* o, const int16_t m[3][3], const int64_t t12[3], int small_t, int n, int last)
+{
+    const int32_t v0 = lo16(D(n * 2)), v1 = hi16(D(n * 2)), v2 = lo16(D(n * 2 + 1));
     int64_t mac[3];
+    if (small_t && (uint32_t)(v0 + 0x2000) < 0x4000 && (uint32_t)(v1 + 0x2000) < 0x4000 && (uint32_t)(v2 + 0x2000) < 0x4000) {
+        /* |T| < 2^17 and |V| < 2^13: the sum stays under 2^31, so 32-bit
+           arithmetic is exact and no MAC overflow is possible */
+        for (int i = 0; i < 3; i++) {
+            int32_t a = (int32_t)t12[i] + m[i][0] * v0 + m[i][1] * v1 + m[i][2] * v2;
+            mac[i] = a;
+            D(25 + i) = (uint32_t)(a >> o->sf);
+        }
+    } else
     for (int i = 0; i < 3; i++) {
-        int64_t a = mac_chk(o, i + 1, t[i] * 0x1000 + (int64_t)m[i][0] * v16[0]);
-        a = mac_chk(o, i + 1, a + (int64_t)m[i][1] * v16[1]);
-        a = mac_chk(o, i + 1, a + (int64_t)m[i][2] * v16[2]);
+        int64_t a = t12[i] + (int64_t)(m[i][0] * v0) + (int64_t)(m[i][1] * v1) + (int64_t)(m[i][2] * v2);
+        a = mac_fast(o, i + 1, a);
         mac[i] = a;
         D(25 + i) = (uint32_t)(int32_t)(a >> o->sf);
     }
@@ -169,7 +183,6 @@ static void rtp(CPUState* cpu, Op* o, int n, int last)
     uint16_t z = sat_z(o, mac[2] >> 12);
     push_sz(cpu, z);
     int overflow = 0;
-    psx_gte_initialize_divide_table();
     uint32_t q = (uint32_t)psx_gte_divide((uint16_t)C(26), z, &overflow);
     if (overflow) o->flag |= F_DIV;
     int64_t sx = (int64_t)q * ir(cpu, 1) + (int32_t)C(24);
@@ -180,6 +193,16 @@ static void rtp(CPUState* cpu, Op* o, int n, int last)
         set_mac0(cpu, o, dq);
         set_ir0(cpu, o, dq >> 12);
     }
+}
+static void rtp(CPUState* cpu, Op* o, int first, int count)
+{
+    int16_t m[3][3];
+    mat(cpu, 0, m);
+    const int32_t tx = (int32_t)C(5), ty = (int32_t)C(6), tz = (int32_t)C(7);
+    const int64_t t12[3] = { (int64_t)tx << 12, (int64_t)ty << 12, (int64_t)tz << 12 };
+    const int small_t = (uint32_t)(tx + 0x20000) < 0x40000 && (uint32_t)(ty + 0x20000) < 0x40000 &&
+                        (uint32_t)(tz + 0x20000) < 0x40000;
+    for (int k = 0; k < count; k++) rtp_m(cpu, o, m, t12, small_t, first + k, k == count - 1);
 }
 
 /* ---- lighting pipeline pieces ---- */
@@ -248,7 +271,7 @@ void gte_execute_at(CPUState* cpu, uint32_t cmd, uint32_t pc)
     Op* op = &o;
     switch (cmd & 0x3F) {
     case 0x01: rtp(cpu, op, 0, 1); break;                                   /* RTPS */
-    case 0x30: rtp(cpu, op, 0, 0); rtp(cpu, op, 1, 0); rtp(cpu, op, 2, 1); break; /* RTPT */
+    case 0x30: rtp(cpu, op, 0, 3); break;                                   /* RTPT */
     case 0x06: {                                                            /* NCLIP */
         int64_t x0 = lo16(D(12)), y0 = hi16(D(12)), x1 = lo16(D(13)), y1 = hi16(D(13));
         int64_t x2 = lo16(D(14)), y2 = hi16(D(14));

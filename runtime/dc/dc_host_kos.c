@@ -39,8 +39,13 @@ int dc_boot_exe(const void* exe, size_t size);
 static int s_text_y = 16;
 static char s_line[96]; static int s_line_n;
 
+extern int g_dc_pvr_on;
+int dc_gpu_pvr_init(void);
+void dc_gpu_pvr_vblank(void);
+
 static void screen_line(const char* t)
 {
+    if (g_dc_pvr_on) return;        /* the PowerVR owns the screen now */
     if (s_text_y + 24 > 480) { vid_clear(0, 0, 0); s_text_y = 16; }
     char buf[56]; int n = 0;
     for (; *t && n < 52; t++) buf[n++] = *t;
@@ -307,6 +312,13 @@ static void perf_report(const DcGpuDisplay* d)
         char b[96];
         snprintf(b, sizeof b, "[perf] %u vblanks: guest saw %u, %u frames drawn\n", t - last_total, polls, flips);
         dbgio_write_str(b);
+        if (g_dc_pvr_on) {
+            extern unsigned g_dc_pvr_stat[4];
+            snprintf(b, sizeof b, "[pvr] prims %u, software %u, textures %u, scenes %u\n",
+                     g_dc_pvr_stat[0], g_dc_pvr_stat[1], g_dc_pvr_stat[2], g_dc_pvr_stat[3]);
+            dbgio_write_str(b);
+            memset(g_dc_pvr_stat, 0, sizeof g_dc_pvr_stat);
+        }
         last_total = t; polls = flips = 0;
 #ifdef DC_PROFILE
         unsigned n = g_prof_n;
@@ -324,6 +336,7 @@ void dc_host_vblank(void)
     static unsigned n;
     DcGpuDisplay d; dc_gpu_display(&d);
     perf_report(&d);
+    if (g_dc_pvr_on) { dc_gpu_pvr_vblank(); return; }
     if (++n < 180) return;          /* leave the boot messages up for ~3 s */
     if (!d.enabled || d.depth24 || d.w <= 0 || d.h <= 0) return;
     int sx = d.w <= 320 ? 2 : 1, sy = d.h <= 240 ? 2 : 1;
@@ -377,6 +390,10 @@ static void* game_thread(void* arg)
 {
     (void)arg;
     step("[xg] 5/5 starting the game");
+#ifndef DC_SOFT_GPU
+    /* PowerVR rendering; build with -DDC_SOFT_GPU for the software one */
+    if (dc_gpu_pvr_init()) dc_host_log("[xg] PowerVR init failed, software rendering\n");
+#endif
     return (void*)(intptr_t)dc_boot_exe(s_exe, s_exe_size);
 }
 

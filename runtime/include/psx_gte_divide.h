@@ -28,7 +28,15 @@ static inline void psx_gte_initialize_divide_table(void) {
 }
 
 static inline unsigned int psx_gte_clz16(uint16_t value) {
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__SH4__) || defined(__sh__)
+    /* no count-leading-zeros instruction: a 256-entry table */
+    static const uint8_t lz8[256] = {
+        8,7,6,6,5,5,5,5,4,4,4,4,4,4,4,4,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
+        2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1 };
+    return value >> 8 ? lz8[value >> 8] : 8u + lz8[value & 0xFF];
+#elif defined(__GNUC__) || defined(__clang__)
     /* __builtin_clz is undefined for zero; the portable loop returns 16. */
     return value ? (unsigned int)__builtin_clz((unsigned int)value) -
         (unsigned int)(sizeof(unsigned int) * 8u - 16u) : 16u;

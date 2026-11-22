@@ -11,6 +11,30 @@
 #include <string.h>
 
 uint16_t g_dc_vram[1024 * 512];
+uint32_t g_dc_vram_gen[32][16];
+
+__attribute__((weak)) int dc_gpu_hw_prim(const DcPrim* p) { (void)p; return 0; }
+__attribute__((weak)) void dc_gpu_hw_fill(int x, int y, int w, int h, uint16_t c) { (void)x; (void)y; (void)w; (void)h; (void)c; }
+__attribute__((weak)) void dc_gpu_hw_flip(void) {}
+__attribute__((weak)) void dc_gpu_hw_blit(int x, int y, int w, int h, int cx0, int cy0, int cx1, int cy1)
+{ (void)x; (void)y; (void)w; (void)h; (void)cx0; (void)cy0; (void)cx1; (void)cy1; }
+
+/* Mark a VRAM rectangle as written (wraps at the VRAM edges). */
+static void vram_touch(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    if (w > 1024) w = 1024;
+    if (h > 512) h = 512;
+    int bx0 = (x & 1023) >> 6, bx1 = ((x + w - 1) & 1023) >> 6;
+    int by0 = (y & 511) >> 4, by1 = ((y + h - 1) & 511) >> 4;
+    for (int by = by0;; by = (by + 1) & 31) {
+        for (int bx = bx0;; bx = (bx + 1) & 15) {
+            g_dc_vram_gen[by][bx]++;
+            if (bx == bx1) break;
+        }
+        if (by == by1) break;
+    }
+}
 
 static struct {
     /* GP0 state */
@@ -205,6 +229,7 @@ static void triangle(const Shade* s, Vtx a, Vtx b, Vtx c)
     minx = minx < G.clip_x0 ? G.clip_x0 : minx; maxx = maxx > G.clip_x1 ? G.clip_x1 : maxx;
     miny = miny < G.clip_y0 ? G.clip_y0 : miny; maxy = maxy > G.clip_y1 ? G.clip_y1 : maxy;
     if (minx > maxx || miny > maxy) return;
+    vram_touch(minx, miny, maxx - minx + 1, maxy - miny + 1);
 
     /* edge i: e(x,y) = (q1 - q0) x (p - q0) for edges bc, ca, ab; a pixel is
      * inside when e >= t (t = 1 on edges that are not top-left) */
@@ -260,6 +285,14 @@ static void triangle(const Shade* s, Vtx a, Vtx b, Vtx c)
     }
 }
 
+/* The texture window as an area of the page that repeats. */
+static void prim_tw(DcPrim* p)
+{
+    uint32_t mx = G.tw_mask_x & 31, my = G.tw_mask_y & 31;
+    p->tw_w = mx ? 8 << __builtin_ctz(mx) : 256; p->tw_u0 = (int)((G.tw_off_x & mx) * 8);
+    p->tw_h = my ? 8 << __builtin_ctz(my) : 256; p->tw_v0 = (int)((G.tw_off_y & my) * 8);
+}
+
 static void polygon(const uint32_t* w)
 {
     uint32_t op = w[0] >> 24;
@@ -291,6 +324,19 @@ static void polygon(const uint32_t* w)
         } else v[k].u = v[k].v = 0;
     }
     if (!s.tex) s.semi_mode = (G.texpage >> 5) & 3;
+    {
+        DcPrim p;
+        p.n = n; p.tex = s.tex; p.raw = s.raw; p.semi = s.semi; p.semi_mode = (int)s.semi_mode;
+        p.gouraud = s.gouraud; p.depth = (int)s.depth;
+        p.tp_x = s.tp_x; p.tp_y = s.tp_y; p.clut_x = s.clut_x; p.clut_y = s.clut_y;
+        p.clip_x0 = G.clip_x0; p.clip_y0 = G.clip_y0; p.clip_x1 = G.clip_x1; p.clip_y1 = G.clip_y1;
+        prim_tw(&p);
+        for (int k = 0; k < n; k++) {
+            p.v[k].x = v[k].x; p.v[k].y = v[k].y; p.v[k].r = v[k].r; p.v[k].g = v[k].g; p.v[k].b = v[k].b;
+            p.v[k].u = v[k].u; p.v[k].v = v[k].v;
+        }
+        if (dc_gpu_hw_prim(&p) == 1) return;    /* 2: drawn, keep VRAM up to date too */
+    }
     triangle(&s, v[0], v[1], v[2]);
     if (quad) triangle(&s, v[1], v[2], v[3]);
 }
@@ -319,6 +365,23 @@ static void rectangle(const uint32_t* w)
     int r = w[0] & 0xFF, g = (w[0] >> 8) & 0xFF, b = (w[0] >> 16) & 0xFF;
     if (s.raw) r = g = b = 128;
     int fx = (G.texpage >> 12) & 1, fy = (G.texpage >> 13) & 1;
+    {
+        DcPrim p;
+        p.n = 4; p.tex = s.tex; p.raw = s.raw; p.semi = s.semi; p.semi_mode = (int)s.semi_mode;
+        p.gouraud = 0; p.depth = (int)s.depth;
+        p.tp_x = s.tp_x; p.tp_y = s.tp_y; p.clut_x = s.clut_x; p.clut_y = s.clut_y;
+        p.clip_x0 = G.clip_x0; p.clip_y0 = G.clip_y0; p.clip_x1 = G.clip_x1; p.clip_y1 = G.clip_y1;
+        prim_tw(&p);
+        int du = fx ? -wdt : wdt, dv = fy ? -hgt : hgt;
+        const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
+        for (int k = 0; k < 4; k++) {
+            p.v[k].x = x + cx[k] * wdt; p.v[k].y = y + cy[k] * hgt;
+            p.v[k].r = r; p.v[k].g = g; p.v[k].b = b;
+            p.v[k].u = u0 + cx[k] * du; p.v[k].v = v0 + cy[k] * dv;
+        }
+        if (dc_gpu_hw_prim(&p) == 1) return;
+    }
+    vram_touch(x, y, wdt, hgt);
     for (int yy = 0; yy < hgt; yy++) {
         int py = y + yy;
         if (py < G.clip_y0 || py > G.clip_y1) continue;
@@ -338,6 +401,7 @@ static void line(int x0, int y0, uint32_t c0, int x1, int y1, uint32_t c1, int g
     if (adx > 1023 || ady > 511) return;
     int n = adx > ady ? adx : ady;
     int mode = (G.texpage >> 5) & 3;
+    vram_touch(x0 < x1 ? x0 : x1, y0 < y1 ? y0 : y1, adx + 1, ady + 1);
     for (int k = 0; k <= n; k++) {
         int x = n ? x0 + (dx * k + (dx < 0 ? -n / 2 : n / 2)) / n : x0;
         int y = n ? y0 + (dy * k + (dy < 0 ? -n / 2 : n / 2)) / n : y0;
@@ -416,6 +480,7 @@ static void execute(const uint32_t* w, int n)
     case 4: {                                   /* VRAM -> VRAM */
         int sx = w[1] & 0x3FF, sy = (w[1] >> 16) & 0x1FF, dx = w[2] & 0x3FF, dy = (w[2] >> 16) & 0x1FF;
         int ww = ((w[3] - 1) & 0x3FF) + 1, hh = (((w[3] >> 16) - 1) & 0x1FF) + 1;
+        vram_touch(dx, dy, ww, hh);
         for (int y = 0; y < hh; y++)
             for (int x = 0; x < ww; x++) {
                 uint16_t c = *px(sx + x, sy + y);
@@ -423,12 +488,14 @@ static void execute(const uint32_t* w, int n)
                 if (G.check_mask && (*d & 0x8000)) continue;
                 *d = c | (G.set_mask ? 0x8000 : 0);
             }
+        dc_gpu_hw_blit(dx, dy, ww, hh, G.clip_x0, G.clip_y0, G.clip_x1, G.clip_y1);
         return;
     }
     case 5:                                     /* CPU -> VRAM: data follows */
         G.load_x = w[1] & 0x3FF; G.load_y = (w[1] >> 16) & 0x1FF;
         G.load_w = ((w[2] - 1) & 0x3FF) + 1; G.load_h = (((w[2] >> 16) - 1) & 0x1FF) + 1;
         G.load_i = 0; G.load_n = G.load_w * G.load_h; G.load_active = 1;
+        vram_touch(G.load_x, G.load_y, G.load_w, G.load_h);
         return;
     case 6:                                     /* VRAM -> CPU: read through GPUREAD */
         G.store_x = w[1] & 0x3FF; G.store_y = (w[1] >> 16) & 0x1FF;
@@ -441,6 +508,8 @@ static void execute(const uint32_t* w, int n)
             int x = w[1] & 0x3F0, y = (w[1] >> 16) & 0x1FF;
             int ww = ((w[2] & 0x3FF) + 0xF) & ~0xF, hh = (w[2] >> 16) & 0x1FF;
             for (int yy = 0; yy < hh; yy++) for (int xx = 0; xx < ww; xx++) *px(x + xx, y + yy) = c;
+            vram_touch(x, y, ww, hh);
+            dc_gpu_hw_fill(x, y, ww, hh, c);
         } else if (op >= 0xE1 && op <= 0xE6) env(w[0]);
         return;
     }
@@ -451,7 +520,11 @@ static void load_pixel(uint16_t c)
     int x = G.load_x + G.load_i % G.load_w, y = G.load_y + G.load_i / G.load_w;
     uint16_t* d = px(x, y);
     if (!(G.check_mask && (*d & 0x8000))) *d = c | (G.set_mask ? 0x8000 : 0);
-    if (++G.load_i >= G.load_n) G.load_active = 0;
+    if (++G.load_i >= G.load_n) {
+        G.load_active = 0;
+        vram_touch(G.load_x, G.load_y, G.load_w, G.load_h);
+        dc_gpu_hw_blit(G.load_x, G.load_y, G.load_w, G.load_h, G.clip_x0, G.clip_y0, G.clip_x1, G.clip_y1);
+    }
 }
 
 void dc_gpu_gp0(uint32_t w)
@@ -515,7 +588,7 @@ void dc_gpu_gp1(uint32_t w)
     case 0x01: G.ncmd = 0; G.load_active = 0; break;
     case 0x03: G.display_off = w & 1; break;
     case 0x04: G.dma_dir = w & 3; break;
-    case 0x05: G.disp_x = w & 0x3FE; G.disp_y = (w >> 10) & 0x1FF; break;
+    case 0x05: G.disp_x = w & 0x3FE; G.disp_y = (w >> 10) & 0x1FF; dc_gpu_hw_flip(); break;
     case 0x08: G.disp_mode = w & 0xFF; break;
     case 0x10:
         switch (w & 7) {
