@@ -26,3 +26,14 @@ extern const int g_dc_overlay_count;
 int dc_overlay_dispatch(CPUState* cpu, uint32_t addr);
 /* Log which overlays cover addr and how many of their samples are resident. */
 void dc_overlay_explain(uint32_t addr);
+
+/* Skip a guest function of one overlay: calls to addr while overlay id is
+ * resident return at once to $ra with v0 = 0. Used to bypass parts that are
+ * not ported yet (FMV). Up to 8 entries. */
+void dc_overlay_skip(const char* id, uint32_t addr);
+/* Same, but run fn first (it may call guest code with dc_call_guest), so the
+ * skip can leave the game state the skipped function would have. */
+typedef void (*DcSkipFn)(CPUState* cpu);
+void dc_overlay_skip_fn(const char* id, uint32_t addr, DcSkipFn fn);
+/* Parse "id@addr[,id@addr...]" (addr in hex), e.g. from an environment variable. */
+void dc_overlay_skip_parse(const char* spec);

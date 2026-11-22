@@ -1682,7 +1682,10 @@ int main(int argc, char** argv) {
     PSXRecomp::CodeGenConfig codegen_config;
     codegen_config.emit_comments = true;
     codegen_config.emit_line_numbers = true;
-    codegen_config.split_mid_function_targets = !overlay_mode;
+    // Overlays keep exact pieces on the PC target, which falls back to its
+    // interpreter for branches into the middle of another piece. The DC
+    // runtime has no interpreter, so those targets become entries there too.
+    codegen_config.split_mid_function_targets = !overlay_mode || output_target == "dc";
     codegen_config.split_skip_data_sources = (output_target == "dc");
     if (output_target == "dc") {
         // No savestates on the DC runtime, and dc_irq_slow services interrupts

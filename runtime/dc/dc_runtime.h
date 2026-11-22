@@ -44,6 +44,10 @@ void dc_fatal(const char* fmt, ...);
 void dc_profile_sample(void);
 int  dc_irq_slow(CPUState* cpu, uint32_t pc);
 
+/* Game hook, called once after the BIOS is set up and before the EXE runs.
+ * The runtime's version does nothing; a game links its own (overlay skips). */
+void dc_game_init(CPUState* cpu);
+
 /* ---- BIOS HLE ---- */
 void dc_bios_init(CPUState* cpu);
 int  dc_bios_call(CPUState* cpu, uint32_t vector);   /* 1 if vector is A0/B0/C0 */

@@ -190,6 +190,8 @@ uint32_t gte_read_ctrl(CPUState* cpu, uint8_t r) { return cpu->gte_ctrl[r & 31];
 void gte_write_data(CPUState* cpu, uint8_t r, uint32_t v) { cpu->gte_data[r & 31] = v; }
 void gte_write_ctrl(CPUState* cpu, uint8_t r, uint32_t v) { cpu->gte_ctrl[r & 31] = v; }
 
+__attribute__((weak)) void dc_game_init(CPUState* cpu) { (void)cpu; }
+
 /* ---- boot -------------------------------------------------------------- */
 static uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
@@ -210,6 +212,7 @@ int dc_boot_exe(const void* exe, size_t size)
     cpu->read_byte = dc_read8;   cpu->write_byte = dc_write8;
     dc_io_reset();
     dc_bios_init(cpu);
+    dc_game_init(cpu);
     cpu->gpr[28] = gp;
     cpu->gpr[29] = cpu->gpr[30] = saddr ? saddr + ssize : 0x801FFFF0u;
     cpu->gpr[31] = DC_SENTINEL_RA;

@@ -49,6 +49,15 @@ overlays that share a load address do not collide. It also generates
 Without a registry a weak empty one is linked. For Xenogears this is
 `dreamcast/build_overlays.py` in the game repository.
 
+## Game hooks
+
+`dc_game_init(CPUState*)` is weak in the runtime and called once before the
+EXE runs. A game overrides it to register `dc_overlay_skip_fn()` entries:
+calls to that overlay function return at once to `$ra`, after an optional
+callback that leaves the state the skipped code would have (for example
+"choose the next scene"). The Linux host also reads
+`DC_SKIP=overlay-id@hexaddr[,...]` for quick experiments.
+
 ## Status
 
 Xenogears' main EXE boots, runs its library initialisation (pad, card, CD,
@@ -57,7 +66,9 @@ reads real sectors from the disc, uploads sound data to SPU RAM and loads its
 first overlays. With the 22 retail overlays linked, the runtime selects the
 movie overlay and the STR library and the game starts the opening FMV, which
 then retries its stream reads: MDEC and streaming reads (ReadS) are not
-emulated yet.
+emulated yet. With the FMV skipped (Xenogears' `dreamcast/xg_dc_game.c`), the
+game loads the field overlay and runs its frame loop: it issues GTE commands
+and GPU display lists every frame (still neither executed nor drawn).
 
 The test host drives VBlank from a thread, not from `SIGALRM`: qemu-sh4 can
 corrupt guest registers when a signal arrives next to an SH-4 delayed branch,

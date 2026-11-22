@@ -1,6 +1,7 @@
 /* dc_host_linux.c - test platform layer: runs the DC runtime as a Linux SH-4
  * program (qemu-sh4), with a 60 Hz VBlank from a host thread. Not for hardware. */
 #include "dc_runtime.h"
+#include "dc_overlay.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -104,6 +105,8 @@ int main(int argc, char** argv)
     sa.sa_sigaction = on_segv; sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0);
     if (getenv("DC_VBLANK_DIV")) s_vblank_div = atoi(getenv("DC_VBLANK_DIV")) > 0 ? atoi(getenv("DC_VBLANK_DIV")) : 10;
+    /* DC_SKIP=overlay-id@hexaddr[,...]: return at once from those functions */
+    if (getenv("DC_SKIP")) dc_overlay_skip_parse(getenv("DC_SKIP"));
     if (argc > 3 && !(s_disc = fopen(argv[3], "rb"))) { perror(argv[3]); return 1; }
     if (argc > 2) {
         signal(SIGVTALRM, on_timeout);

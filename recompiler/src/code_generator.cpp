@@ -3162,6 +3162,13 @@ GeneratedFunction CodeGenerator::generate_function(
             if (block_addr == func.start_addr) continue;
             cps_cur_continuations_.push_back(block_addr);
         }
+    } else if (cps_enabled_) {
+        // Call returns of a jal/jalr that sits in another piece (the piece
+        // starts at its delay slot) are only reachable as continuations.
+        for (uint32_t block_addr : cfg.block_order) {
+            if (block_addr == func.start_addr || block_addr - 8u >= func.start_addr) continue;
+            if (is_link_transfer_at(block_addr - 8u)) cps_cur_continuations_.push_back(block_addr);
+        }
     }
 
     std::stringstream body_ss;
@@ -3570,6 +3577,13 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // an entry switch; the leaders re-enter via the continuation switch below.
     // Owner = aliases[0]->start_addr (same as the call-return continuations). Skip
     // the alias entry PCs (they are dispatched as function entries with cpu->pc==0).
+    if (cps_enabled_ && !config_.continuations_all_leaders) {
+        for (uint32_t block_addr : cfg.block_order) {
+            if (!live_blocks.count(block_addr)) continue;
+            if (block_addr - 8u >= cfg.function_start) continue;
+            if (is_link_transfer_at(block_addr - 8u)) cps_cur_continuations_.push_back(block_addr);
+        }
+    }
     if (cps_enabled_ && config_.continuations_all_leaders) {
         std::set<uint32_t> alias_entries;
         for (const Function* a : aliases) alias_entries.insert(a->start_addr);
@@ -4424,6 +4438,13 @@ std::string CodeGenerator::generate_ranges_manifest(
             ss << fmt::format("R {:08X} {:X}\n", r.first, r.second - r.first);
     }
     return ss.str();
+}
+
+bool CodeGenerator::is_link_transfer_at(uint32_t addr) const {
+    auto w = exe_.read_word(addr);
+    if (!w) return false;
+    const uint32_t op = *w >> 26, rt = (*w >> 16) & 0x1Fu, funct = *w & 0x3Fu;
+    return op == 3u || (op == 0u && funct == 9u) || (op == 1u && (rt == 0x10u || rt == 0x11u));
 }
 
 } // namespace PSXRecomp

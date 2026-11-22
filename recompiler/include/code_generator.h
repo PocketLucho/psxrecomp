@@ -447,6 +447,8 @@ public:
         return cps_continuation_owner_;
     }
 private:
+    // jal, jalr, bltzal or bgezal at addr (its return PC is addr + 8).
+    bool is_link_transfer_at(uint32_t addr) const;
 
     // Set per-function by generate_function when config_.ws_auto_screen_x_cull is
     // on AND the function carries the GTE screen-extent reject signature; read by
