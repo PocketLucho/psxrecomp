@@ -331,10 +331,8 @@ static void polygon(const uint32_t* w)
         p.tp_x = s.tp_x; p.tp_y = s.tp_y; p.clut_x = s.clut_x; p.clut_y = s.clut_y;
         p.clip_x0 = G.clip_x0; p.clip_y0 = G.clip_y0; p.clip_x1 = G.clip_x1; p.clip_y1 = G.clip_y1;
         prim_tw(&p);
-        for (int k = 0; k < n; k++) {
-            p.v[k].x = v[k].x; p.v[k].y = v[k].y; p.v[k].r = v[k].r; p.v[k].g = v[k].g; p.v[k].b = v[k].b;
-            p.v[k].u = v[k].u; p.v[k].v = v[k].v;
-        }
+        _Static_assert(sizeof(Vtx) == sizeof(DcPrimVtx), "same vertex layout");
+        memcpy(p.v, v, (size_t)n * sizeof(Vtx));
         if (dc_gpu_hw_prim(&p) == 1) return;    /* 2: drawn, keep VRAM up to date too */
     }
     triangle(&s, v[0], v[1], v[2]);

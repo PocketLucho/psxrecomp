@@ -107,7 +107,7 @@ static void push_sz(CPUState* cpu, uint16_t z)
 {
     D(16) = D(17); D(17) = D(18); D(18) = D(19); D(19) = z;
 }
-static void push_sxy(CPUState* cpu, Op* o, int64_t x, int64_t y)
+static void push_sxy(CPUState* cpu, Op* o, int32_t x, int32_t y)
 {
     if (x < -0x400) { o->flag |= F_SX2; x = -0x400; } else if (x > 0x3FF) { o->flag |= F_SX2; x = 0x3FF; }
     if (y < -0x400) { o->flag |= F_SY2; y = -0x400; } else if (y > 0x3FF) { o->flag |= F_SY2; y = 0x3FF; }
@@ -220,14 +220,15 @@ static void rtp_m(CPUState* cpu, Op* o, const int16_t m[3][3], const int64_t t12
         if (z12 < -0x8000 || z12 > 0x7FFF) o->flag |= F_IR3;
         D(11) = (uint32_t)(int32_t)(v < lo ? lo : v > 0x7FFF ? 0x7FFF : v);
     }
-    uint16_t z = sat_z(o, mac[2] >> 12);
+    const int32_t z12 = (int32_t)(mac[2] >> 12);     /* a 44-bit MAC fits */
+    uint16_t z = z12 < 0 ? (o->flag |= F_SZ3, 0) : z12 > 0xFFFF ? (o->flag |= F_SZ3, 0xFFFF) : (uint16_t)z12;
     push_sz(cpu, z);
     int overflow = 0;
     uint32_t q = gte_div((uint16_t)C(26), z, &overflow);
     if (overflow) o->flag |= F_DIV;
     int64_t sx = (int64_t)q * ir(cpu, 1) + (int32_t)C(24);
     int64_t sy = (int64_t)q * ir(cpu, 2) + (int32_t)C(25);
-    push_sxy(cpu, o, sx >> 16, sy >> 16);
+    push_sxy(cpu, o, (int32_t)(sx >> 16), (int32_t)(sy >> 16));
     if (last) {
         int64_t dq = (int64_t)(int16_t)C(27) * q + (int32_t)C(28);
         set_mac0(cpu, o, dq);

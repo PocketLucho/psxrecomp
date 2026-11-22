@@ -31,6 +31,21 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Vertices and headers for the tile accelerator are gathered here and sent
+   in one store-queue copy, not one locked copy per 32 bytes. */
+#define TA_BUF 2048
+static uint8_t s_ta[TA_BUF] __attribute__((aligned(32)));
+static int s_ta_n;
+static void ta_flush(void)
+{
+    if (s_ta_n) { pvr_prim(s_ta, (size_t)s_ta_n); s_ta_n = 0; }
+}
+static inline void ta_put(const void* d, size_t n)
+{
+    if (s_ta_n + (int)n > TA_BUF) ta_flush();
+    memcpy(s_ta + s_ta_n, d, n); s_ta_n += (int)n;
+}
+
 int g_dc_pvr_on;                    /* set once dc_gpu_pvr_init() ran */
 static int s_scene;                 /* a scene and the TR list are open */
 static int s_ox, s_oy;              /* VRAM origin of the frame being built */
@@ -68,7 +83,10 @@ static unsigned s_rtt_idle;         /* frames since one read itself */
 /* ---- texture cache ------------------------------------------------------ */
 #define NTEX 24            /* at most; as many as fit in video memory */
 static int s_ntex;
-typedef struct { uint32_t key, win, stamp, used; uint16_t cells[16]; pvr_ptr_t tex; } TexEnt;
+/* Full pages (banded) keep a stamp per 16-row band and the CLUT's block
+   stamp and contents hash, so a write elsewhere on the page or in the CLUT
+   row only redoes what it touched. */
+typedef struct { uint32_t key, win, stamp, used, cst, chash; uint16_t cells[16]; uint32_t bst[16]; pvr_ptr_t tex; } TexEnt;
 static TexEnt s_tex[NTEX];
 static uint16_t s_conv[256 * 256] __attribute__((aligned(32)));
 static uint16_t s_clut[256];
@@ -96,6 +114,15 @@ static uint32_t stamp_of(int x, int w, int y, int h)
         if (by == by1) break;
     }
     return s;
+}
+
+static uint32_t clut_hash(const DcPrim* p)
+{
+    const uint16_t* cl = &g_dc_vram[(p->clut_y & 511) << 10];
+    int n = p->depth == 0 ? 16 : 256;
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) h = (h ^ cl[(p->clut_x + (uint32_t)i) & 1023]) * 16777619u;
+    return h;
 }
 
 /* Convert rows y0..y1-1 of a full page (window-less), or the whole texture
@@ -186,8 +213,7 @@ static pvr_ptr_t texture_for(const DcPrim* p)
     if (depth < 2) key |= (p->clut_x >> 4) << 9 | (p->clut_y & 511);
     if (depth == 3) key = 3u << 30 | (p->tp_x & 1023) << 9 | (p->tp_y & 511);
     int tw = depth == 3 ? 256 : 64 << depth;
-    uint32_t st = stamp_of((int)p->tp_x, tw, (int)p->tp_y, 256);
-    if (depth < 2) st = st * 31u + stamp_of((int)p->clut_x, depth == 0 ? 16 : 256, (int)p->clut_y, 1);
+    uint32_t cs = depth < 2 ? stamp_of((int)p->clut_x, depth == 0 ? 16 : 256, (int)p->clut_y, 1) : 0;
     const uint32_t win = depth == 3 ? 0 : (uint32_t)(win_w(p) & 511) | (uint32_t)(win_h(p) & 511) << 9 |
                          (uint32_t)(p->tw_u0 & 255) << 18 | (uint32_t)(p->tw_v0 & 63) << 26;
     /* full pages are converted in cells of 16x16 texels, as primitives need them */
@@ -205,9 +231,33 @@ static pvr_ptr_t texture_for(const DcPrim* p)
         b0 = v0 >> 4; b1 = v1 >> 4;
         cols = (0xFFFFu >> (15 - (u1 >> 4))) & (0xFFFFu << (u0 >> 4));
     }
+    uint32_t st = 0;
+    if (!banded) st = stamp_of((int)p->tp_x, tw, (int)p->tp_y, 256) * 31u + cs;
     int victim = -1;
     for (int i = 0; i < s_ntex; i++) {
         TexEnt* e = &s_tex[i];
+        if (e->key == key && e->win == win && banded) {
+            e->used = s_frame;
+            if (depth < 2 && cs != e->cst) {
+                e->cst = cs;
+                uint32_t h = clut_hash(p);
+                if (h != e->chash) { e->chash = h; memset(e->cells, 0, sizeof e->cells); }
+            }
+            for (int b = b0; b <= b1; b++) {
+                uint32_t bs = stamp_of((int)p->tp_x, tw, (int)p->tp_y + b * 16, 16);
+                if (bs != e->bst[b]) {
+                    e->bst[b] = bs; e->cells[b] = 0;
+#ifdef DC_PVR_TEXSTAT
+                    s_tstat[depth][1]++;
+#endif
+                }
+                uint32_t miss = cols & ~(uint32_t)e->cells[b];
+                if (!miss) continue;
+                fill_cells(e, p, b, miss);
+                e->cells[b] |= (uint16_t)miss;
+            }
+            return e->tex;
+        }
         if (e->key == key && e->win == win) {
             e->used = s_frame;
             if (e->stamp == st) {
@@ -242,6 +292,8 @@ static pvr_ptr_t texture_for(const DcPrim* p)
     /* plain CPU copy: the store queues are busy feeding the TA */
     if (banded) {
         memset(e->cells, 0, sizeof e->cells);
+        e->cst = cs; e->chash = depth < 2 ? clut_hash(p) : 0;
+        for (int b = 0; b < 16; b++) e->bst[b] = stamp_of((int)p->tp_x, tw, (int)p->tp_y + b * 16, 16);
         for (int b = b0; b <= b1; b++) { fill_cells(e, p, b, cols); e->cells[b] = (uint16_t)cols; }
     } else {
         convert(p, 0, 256, 0, 256);
@@ -504,6 +556,7 @@ static void send_header_ex(const DcPrim* p, pvr_ptr_t tex, uint32_t fmt, int tw,
    scene from it. */
 static void rtt_split(void)
 {
+    ta_flush();
     pvr_list_finish();
     pvr_scene_finish();
     pvr_wait_ready();
@@ -522,7 +575,7 @@ static void rtt_split(void)
         vx.u = (float)(cx[k] * 640) * (1.0f / RTT_W);
         vx.v = (float)(cy[k] * 480) * (1.0f / RTT_H);
         vx.argb = 0xFFFFFFFFu; vx.oargb = 0;
-        pvr_prim(&vx, sizeof vx);
+        ta_put(&vx, sizeof vx);
     }
 }
 
@@ -548,6 +601,7 @@ static void scene_close(void)
 #ifdef DC_PVR_SCENELOG
     { DcGpuDisplay d_; dc_gpu_display(&d_); char b[128]; snprintf(b, sizeof b, "[sc %u] at %d,%d prims %u bg %d disp %d,%d %dx%d en%d rtt%d\n", s_frame, s_ox, s_oy, s_prims, s_bg, d_.x, d_.y, d_.w, d_.h, d_.enabled, s_rtt_split); dbgio_write_str(b); }
 #endif
+    ta_flush();
     pvr_list_finish();
     pvr_scene_finish();
     s_scene = 0;
@@ -648,7 +702,7 @@ static void send_header_ex(const DcPrim* p, pvr_ptr_t tex, uint32_t fmt, int tw,
     }
     pvr_poly_hdr_t h;
     pvr_poly_compile(&h, &c);
-    pvr_prim(&h, sizeof h);
+    ta_put(&h, sizeof h);
 }
 
 static inline uint32_t colour(const DcPrim* p, const DcPrimVtx* v, uint32_t a)
@@ -770,23 +824,27 @@ int dc_gpu_hw_prim(const DcPrim* p)
     }
     uint32_t a = 255;
     if (p->semi) a = p->semi_mode == 0 ? 128 : p->semi_mode == 3 ? 64 : 255;
-    pvr_vertex_t vx;
-    for (int k = 0; k < p->n; k++) {
+    if (s_ta_n + p->n * 32 > TA_BUF) ta_flush();
+    pvr_vertex_t* o = (pvr_vertex_t*)(s_ta + s_ta_n);
+    s_ta_n += p->n * 32;
+    float su, sv, bu = 0, bv = 0;
+    if (rtt) {
+        su = s_sx * (1.0f / RTT_W); sv = s_sy * (1.0f / RTT_H);
+        bu = (float)((int)p->tp_x - s_ox) * su; bv = (float)((int)p->tp_y - s_oy) * sv;
+    } else {
+        su = 1.0f / (float)win_w(p); sv = 1.0f / (float)win_h(p);
+    }
+    const float fox = (float)s_ox, foy = (float)s_oy;
+    for (int k = 0; k < p->n; k++, o++) {
         const DcPrimVtx* v = &p->v[k];
-        vx.flags = k == p->n - 1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-        vx.x = (float)(v->x - s_ox) * s_sx;
-        vx.y = (float)(v->y - s_oy) * s_sy;
-        vx.z = 1.0f;
-        if (rtt) {
-            vx.u = (float)((int)p->tp_x + v->u - s_ox) * s_sx * (1.0f / RTT_W);
-            vx.v = (float)((int)p->tp_y + v->v - s_oy) * s_sy * (1.0f / RTT_H);
-        } else {
-            vx.u = (float)v->u * (1.0f / (float)win_w(p));
-            vx.v = (float)v->v * (1.0f / (float)win_h(p));
-        }
-        vx.argb = colour(p, v, a);
-        vx.oargb = 0;
-        pvr_prim(&vx, sizeof vx);
+        o->flags = k == p->n - 1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        o->x = ((float)v->x - fox) * s_sx;
+        o->y = ((float)v->y - foy) * s_sy;
+        o->z = 1.0f;
+        o->u = (float)v->u * su + bu;
+        o->v = (float)v->v * sv + bv;
+        o->argb = colour(p, v, a);
+        o->oargb = 0;
     }
 #ifdef DC_PVR_SHADOW_ALL
     ++s_prims; return 2;
@@ -834,7 +892,7 @@ void dc_gpu_hw_fill(int x, int y, int w, int h, uint16_t c)
         vx.z = 1.0f; vx.u = vx.v = 0;
         vx.argb = colour(&p, &p.v[k], 255);
         vx.oargb = 0;
-        pvr_prim(&vx, sizeof vx);
+        ta_put(&vx, sizeof vx);
     }
 }
 
@@ -861,7 +919,7 @@ static void blit(int x, int y, int w, int h)
                 vx.u = (float)(cx[k] * tw) * (1.0f / 256.0f);
                 vx.v = (float)(cy[k] * th) * (1.0f / 256.0f);
                 vx.argb = 0xFFFFFFFFu; vx.oargb = 0;
-                pvr_prim(&vx, sizeof vx);
+                ta_put(&vx, sizeof vx);
             }
         }
 }
