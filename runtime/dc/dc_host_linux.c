@@ -1,12 +1,14 @@
 /* dc_host_linux.c - test platform layer: runs the DC runtime as a Linux SH-4
- * program (qemu-sh4), with a 60 Hz VBlank from SIGALRM. Not for hardware. */
+ * program (qemu-sh4), with a 60 Hz VBlank from a host thread. Not for hardware. */
 #include "dc_runtime.h"
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
+#include <ucontext.h>
 
 int dc_boot_exe(const void* exe, size_t size);
 
@@ -43,28 +45,50 @@ int dc_host_cd_read_sector(uint32_t lba, uint8_t* out)
  * faster than a PS1. */
 static int s_vblank_div = 10;
 
-/* 600 Hz tick: every tick lets timed devices advance, every 10th is a VBlank. */
-static void on_alarm(int sig)
+/* 600 Hz tick on a host thread: every tick lets timed devices advance, every
+ * s_vblank_div-th one counts a VBlank. A thread rather than SIGALRM because
+ * qemu-sh4 can corrupt guest registers when a signal lands next to an SH-4
+ * delayed branch, which showed up as random crashes. */
+static volatile unsigned s_vblanks;
+
+unsigned dc_host_take_vblanks(void) { return __atomic_exchange_n(&s_vblanks, 0u, __ATOMIC_ACQ_REL); }
+
+static void* tick_thread(void* arg)
 {
-    static int n;
-    (void)sig;
-    dc_profile_sample();
-    if (++n >= s_vblank_div) { n = 0; dc_irq_raise(1u); }
-    g_irq_pending = 1;
+    (void)arg;
+    struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
+    for (int n = 0;;) {
+        next.tv_nsec += 1668000;
+        if (next.tv_nsec >= 1000000000) { next.tv_nsec -= 1000000000; next.tv_sec++; }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, 0);
+        dc_profile_sample();
+        if (++n >= s_vblank_div) { n = 0; __atomic_add_fetch(&s_vblanks, 1u, __ATOMIC_ACQ_REL); }
+        g_irq_pending = 1;
+    }
+    return 0;
 }
 
 void dc_host_start_vblank_timer(void)
 {
-    signal(SIGALRM, on_alarm);
-    struct itimerval it = {{0, 1668}, {0, 1668}};
-    setitimer(ITIMER_REAL, &it, 0);
+    pthread_t t;
+    sigset_t all, old; sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);      /* signals stay on the guest thread */
+    pthread_create(&t, 0, tick_thread, 0);
+    pthread_sigmask(SIG_SETMASK, &old, 0);
 }
 
 static void on_timeout(int sig) { (void)sig; dc_fatal("time limit reached"); }
 static void on_segv(int sig, siginfo_t* si, void* uc)
 {
-    (void)sig; (void)uc; int here;
-    dc_fatal("host crash (SIGSEGV) at %p, host stack near %p", si->si_addr, (void*)&here);
+    (void)sig; int here;
+#if defined(__sh__)
+    const mcontext_t* m = &((const ucontext_t*)uc)->uc_mcontext;
+    dc_fatal("host crash (signal %d) at %p, host pc=%08X pr=%08X r15=%08X, stack near %p", sig, si->si_addr,
+             m->pc, m->pr, m->gregs[15], (void*)&here);
+#else
+    (void)uc;
+    dc_fatal("host crash (signal %d) at %p, host stack near %p", sig, si->si_addr, (void*)&here);
+#endif
 }
 
 int main(int argc, char** argv)
@@ -78,7 +102,7 @@ int main(int argc, char** argv)
     sigaltstack(&ss, 0);
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_segv; sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
-    sigaction(SIGSEGV, &sa, 0);
+    sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0);
     if (getenv("DC_VBLANK_DIV")) s_vblank_div = atoi(getenv("DC_VBLANK_DIV")) > 0 ? atoi(getenv("DC_VBLANK_DIV")) : 10;
     if (argc > 3 && !(s_disc = fopen(argv[3], "rb"))) { perror(argv[3]); return 1; }
     if (argc > 2) {

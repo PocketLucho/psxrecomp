@@ -37,6 +37,9 @@ static void profile_dump(void)
     }
 }
 
+/* Last dispatched guest addresses, printed by dc_fatal. */
+static uint32_t s_ring[16]; static unsigned s_ring_pos;
+
 void dc_fatal(const char* fmt, ...)
 {
     char b[256];
@@ -52,6 +55,12 @@ void dc_fatal(const char* fmt, ...)
              (unsigned long long)g_dc_stats.cd_cmds, (unsigned long long)g_dc_stats.gte_ops,
              (unsigned)g_dc_stats.last_addr);
     dc_host_log(b);
+    dc_host_log("[trail]");
+    for (unsigned i = 0; i < 16; i++) {
+        snprintf(b, sizeof b, " %08X", (unsigned)s_ring[(s_ring_pos + i) & 15]);
+        dc_host_log(b);
+    }
+    dc_host_log("\n");
     profile_dump();
     exit(1);
 }
@@ -107,6 +116,7 @@ void dc_run(CPUState* cpu, uint32_t addr, uint32_t stop_ra)
         if (g_irq_pending) deliver_irq(cpu);
         g_dc_stats.dispatches++;
         g_dc_stats.last_addr = addr;
+        s_ring[s_ring_pos++ & 15] = addr;
         uint32_t p = dc_phys(addr);
         if (p == 0xA0u || p == 0xB0u || p == 0xC0u) {
             dc_bios_call(cpu, p);
@@ -152,6 +162,9 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys)
 void psx_native_bad_entry(CPUState* cpu, uint32_t owner, uint32_t pc)
 {
     dc_overlay_explain(pc);
+    char b[64];
+    snprintf(b, sizeof b, "[bad-entry] host caller %p\n", __builtin_return_address(0));
+    dc_host_log(b);
     dc_fatal("bad continuation %08X in function %08X (ra=%08X)", (unsigned)pc, (unsigned)owner,
              (unsigned)cpu->gpr[31]);
 }

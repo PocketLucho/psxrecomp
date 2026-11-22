@@ -11,7 +11,7 @@ DC output links against.
 | `dc_core.c` | CPS dispatch trampoline, interrupt delivery (in place, as `--target dc` requires), glue symbols, PS-X EXE boot |
 | `dc_overlay.h`, `dc_overlay.c` | Overlay selection: on a dispatch miss in the main program, runs the registered overlay whose range holds the address and whose sample code words match guest RAM |
 | `dc_bios.c` | High-level BIOS: A0/B0/C0 services, kernel tables, events, `SysEnqIntRP` chains, `HookEntryInt`/`ReturnFromException`, critical sections |
-| `dc_host_linux.c` | Test platform layer: runs as a Linux SH-4 program under `qemu-sh4`, 60 Hz VBlank from `SIGALRM` |
+| `dc_host_linux.c` | Test platform layer: runs as a Linux SH-4 program under `qemu-sh4`, 60 Hz VBlank from a host thread |
 
 A KallistiOS platform layer will replace `dc_host_linux.c` on hardware.
 
@@ -28,7 +28,7 @@ for f in dc_mem dc_core dc_bios dc_overlay dc_host_linux; do
 done
 # overlays (optional): objects and registry from the game's overlay build
 sh4-linux-gnu-gcc $CFLAGS -c ov/dc_overlay_registry.c -o obj/registry.o
-sh4-linux-gnu-gcc -static -o xg_dc obj/*.o ov/obj/*.o
+sh4-linux-gnu-gcc -static -pthread -o xg_dc obj/*.o ov/obj/*.o
 # arguments: EXE, CPU-time limit in seconds, raw 2352-byte disc image (.bin)
 DC_VBLANK_DIV=1 qemu-sh4 xg_dc path/to/SLUS_006.64 60 path/to/disc1.bin
 ```
@@ -57,8 +57,13 @@ reads real sectors from the disc, uploads sound data to SPU RAM and loads its
 first overlays. With the 22 retail overlays linked, the runtime selects the
 movie overlay and the STR library and the game starts the opening FMV, which
 then retries its stream reads: MDEC and streaming reads (ReadS) are not
-emulated yet. Some runs end with a host crash or a "bad continuation" error
-whose cause is still open (it depends on interrupt timing).
+emulated yet.
+
+The test host drives VBlank from a thread, not from `SIGALRM`: qemu-sh4 can
+corrupt guest registers when a signal arrives next to an SH-4 delayed branch,
+which made about half the runs crash at random (bad continuations, host
+SIGSEGV, stack-protector aborts). With the thread, 8 of 8 runs reach the time
+limit. `[trail]` in fatal reports lists the last 16 dispatched addresses.
 
 Linked statically, the 22 overlays add about 12.6 MB of SH-4 code, too much to
 keep resident next to the main program in the Dreamcast's 16 MB. On hardware

@@ -195,6 +195,7 @@ static void cd_ack(uint8_t bits)
 static uint64_t s_cd_next_us;
 void dc_io_poll(void)
 {
+    if (dc_host_take_vblanks()) dc_irq_raise(1u);
     if (!s_cd_reading || s_cd_if != 0 || s_cd_npend) return;
     uint64_t now = dc_host_ticks_us();
     if (now < s_cd_next_us) return;

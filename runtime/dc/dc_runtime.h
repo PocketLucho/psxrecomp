@@ -70,5 +70,9 @@ void dc_host_log(const char* s);
 uint64_t dc_host_ticks_us(void);
 int  dc_host_read_file(const char* path, void** data, size_t* size);
 void dc_host_start_vblank_timer(void);
+/* VBlanks that elapsed since the last call. The host's timer only counts
+ * them and sets g_irq_pending; the core raises the interrupt from dc_io_poll,
+ * so device state is touched by the guest thread alone. */
+unsigned dc_host_take_vblanks(void);
 /* Read one raw 2352-byte sector (LBA from the start of the data track); 0 on success. */
 int  dc_host_cd_read_sector(uint32_t lba, uint8_t* out2352);
