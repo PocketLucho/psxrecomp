@@ -24,6 +24,10 @@
 #include <dc/biosfont.h>
 #include <dc/sq.h>
 #include <dc/sound/stream.h>
+#include <dc/sound/sound.h>
+#include <dc/sound/aica_comm.h>
+#include <dc/spu.h>
+#include <dc/sound/sfxmgr.h>
 #include <arch/timer.h>
 #include <arch/cache.h>
 #include <stdio.h>
@@ -337,6 +341,58 @@ void dc_host_audio_push(const int16_t* lr, unsigned frames, unsigned rate)
     audio_poll();
 }
 
+/* ---- AICA wavetable channels -------------------------------------------
+ * The SPU's voices play on AICA channels through the KOS ARM driver's
+ * channel commands. The stream (CD audio) takes the first channels; the
+ * SPU gets 8 upward. */
+static int s_snd_up, s_chn[24];
+static void snd_up(void)
+{
+    if (s_snd_up) return;
+    if (snd_stream_init() < 0) { s_snd_up = -1; return; }   /* also starts the ARM driver */
+    for (int i = 0; i < 24; i++) {
+        s_chn[i] = snd_sfx_chn_alloc();
+        if (s_chn[i] < 0) { s_snd_up = -1; dbgio_write_str("[snd] no free AICA channels\n"); return; }
+    }
+    s_snd_up = 1;
+}
+int dc_host_snd_hw(void) { snd_up(); return s_snd_up > 0; }
+
+uint32_t dc_host_snd_alloc(uint32_t bytes) { snd_up(); return snd_mem_malloc((bytes + 31u) & ~31u); }
+void dc_host_snd_write(uint32_t off, const int16_t* pcm, unsigned samples)
+{
+    spu_memload(off, pcm, (samples * 2u + 3u) & ~3u);
+}
+void dc_host_snd_free(uint32_t off) { if (off) snd_mem_free(off); }
+
+static void snd_chan_cmd(int ch, uint32_t cmdv, uint32_t off, unsigned samples, int loop,
+                         unsigned loopstart, unsigned freq, unsigned vol, unsigned pan)
+{
+    AICA_CMDSTR_CHANNEL(tmp, cmd, chan);
+    memset(tmp, 0, sizeof tmp);
+    cmd->cmd = AICA_CMD_CHAN;
+    cmd->timestamp = 0;
+    cmd->size = AICA_CMDSTR_CHANNEL_SIZE;
+    cmd->cmd_id = (uint32_t)s_chn[ch];
+    chan->cmd = cmdv;
+    chan->base = off;
+    chan->type = AICA_SM_16BIT;
+    chan->length = samples;
+    chan->loop = (uint32_t)loop;
+    chan->loopstart = loopstart;
+    chan->loopend = samples;
+    chan->freq = freq;
+    chan->vol = vol;
+    chan->pan = pan;
+    snd_sh4_to_aica(tmp, cmd->size);
+}
+void dc_host_snd_start(int ch, uint32_t off, unsigned samples, int loop, unsigned loopstart,
+                       unsigned freq, unsigned vol, unsigned pan)
+{ snd_chan_cmd(ch, AICA_CH_CMD_START, off, samples, loop, loopstart, freq, vol, pan); }
+void dc_host_snd_update(int ch, unsigned freq, unsigned vol, unsigned pan)
+{ snd_chan_cmd(ch, AICA_CH_CMD_UPDATE | AICA_CH_UPDATE_SET_FREQ | AICA_CH_UPDATE_SET_VOL | AICA_CH_UPDATE_SET_PAN, 0, 0, 0, 0, freq, vol, pan); }
+void dc_host_snd_stop(int ch) { snd_chan_cmd(ch, AICA_CH_CMD_STOP, 0, 0, 0, 0, 44100, 0, 0); }
+
 /* ---- video ------------------------------------------------------------ */
 /* PS1 15-bit is BGR (R in the low bits); the framebuffer is RGB555. */
 static uint16_t s_bgr2rgb[32768];
@@ -368,10 +424,13 @@ static void perf_report(const DcGpuDisplay* d)
         char b[96];
         snprintf(b, sizeof b, "[perf] %u vblanks: guest saw %u, %u frames drawn\n", t - last_total, polls, flips);
         dbgio_write_str(b);
-        { extern uint32_t g_dc_spu_peak, g_dc_spu_keyons, g_dc_tmr_irqs[3], g_dc_spu_us, g_dc_spu_frames, g_dc_drv_us;
-          snprintf(b, sizeof b, "[snd] keyons %u peak %u tmr2 %u mix %u ms/%u fr drv %u ms\n", (unsigned)g_dc_spu_keyons, (unsigned)g_dc_spu_peak,
-                   (unsigned)g_dc_tmr_irqs[2], (unsigned)(g_dc_spu_us / 1000), (unsigned)g_dc_spu_frames, (unsigned)(g_dc_drv_us / 1000));
-          g_dc_spu_peak = 0; g_dc_spu_us = g_dc_spu_frames = g_dc_drv_us = 0; dbgio_write_str(b); }
+        { extern uint32_t g_dc_spu_peak, g_dc_spu_keyons, g_dc_tmr_irqs[3], g_dc_spu_us, g_dc_spu_frames, g_dc_drv_us, g_dc_spu_smp_bytes, g_dc_spu_smp_fail;
+          char sb[128];
+          snprintf(sb, sizeof sb, "[snd] keyons %u peak %u tmr2 %u mix %u ms/%u fr drv %u ms smp %u KB fail %u\n", (unsigned)g_dc_spu_keyons, (unsigned)g_dc_spu_peak,
+                   (unsigned)g_dc_tmr_irqs[2], (unsigned)(g_dc_spu_us / 1000), (unsigned)g_dc_spu_frames, (unsigned)(g_dc_drv_us / 1000),
+                   (unsigned)(g_dc_spu_smp_bytes >> 10), (unsigned)g_dc_spu_smp_fail);
+          dbgio_write_str(sb);
+          g_dc_spu_peak = 0; g_dc_spu_us = g_dc_spu_frames = g_dc_drv_us = 0; }
         if (g_dc_pvr_on) {
             extern unsigned g_dc_pvr_stat[4];
             snprintf(b, sizeof b, "[pvr] prims %u, software %u, textures %u, scenes %u\n",

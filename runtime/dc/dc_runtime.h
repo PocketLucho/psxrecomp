@@ -91,3 +91,14 @@ int  dc_host_load_overlay(const char* file, void* dst, uint32_t max);
 void dc_host_code_written(void* p, uint32_t n);
 /* Interleaved stereo PCM from CD audio (XA), `frames` frames at `rate` Hz. */
 void dc_host_audio_push(const int16_t* lr, unsigned frames, unsigned rate);
+/* Hardware wavetable voices (AICA on Dreamcast). dc_host_snd_hw() is 0 when
+ * the host has none; the SPU then mixes in software. Offsets are into sound
+ * RAM; vol and pan are 0-255. */
+int dc_host_snd_hw(void);
+uint32_t dc_host_snd_alloc(uint32_t bytes);
+void dc_host_snd_write(uint32_t off, const int16_t* pcm, unsigned samples);
+void dc_host_snd_free(uint32_t off);
+void dc_host_snd_start(int ch, uint32_t off, unsigned samples, int loop, unsigned loopstart,
+                       unsigned freq, unsigned vol, unsigned pan);
+void dc_host_snd_update(int ch, unsigned freq, unsigned vol, unsigned pan);
+void dc_host_snd_stop(int ch);

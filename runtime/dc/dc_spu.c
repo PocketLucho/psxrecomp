@@ -38,6 +38,12 @@ typedef struct {
     uint16_t env;
     uint32_t adiv;
     int32_t cinc, cdiv; uint8_t cok;   /* cached envelope step for the current level/phase */
+    /* hardware path */
+    int16_t smp_i;          /* sample cache entry, -1 none */
+    uint8_t hw_on;          /* AICA channel playing */
+    uint16_t hw_vol, hw_pan;
+    uint32_t hw_freq;
+    uint64_t pos;           /* play position, 20.12 fixed samples */
 } Voice;
 static Voice s_v[NV];
 
@@ -206,18 +212,220 @@ static void voice_run(int i, Voice* v, int32_t* acc, unsigned n, const int16_t* 
     }
 }
 
+/* ---------------------------------------------------------------- AICA path
+ * With hardware voices the SH4 does not mix: each key-on decodes the voice's
+ * sample (start block to END) to 16-bit PCM once, keeps it in sound RAM and
+ * plays it on an AICA channel, looping where the PS1 data loops. The SH4
+ * still runs the ADSR envelopes and volume sweeps and sends the resulting
+ * volume, pan and pitch to the channel when they change. Not covered: noise
+ * voices, reverb, and SPU IRQs raised by sample playback. */
+static int s_hw = -1;                     /* -1 unknown, 0 software mix, 1 AICA */
+#define NSMP 192
+#define MAXBLK 2340                       /* 65520 samples: AICA loop end is 16 bits */
+typedef struct {
+    uint32_t src, end, rep;               /* SPU RAM: first block, past last block, loop block */
+    uint32_t aica;                        /* sound RAM offset, 0 = free entry */
+    uint16_t len, loopstart;
+    uint8_t loop, stale;
+    uint32_t used;                        /* LRU stamp */
+} HwSmp;
+static HwSmp s_smp[NSMP];
+static uint32_t s_smp_clock;
+static int16_t s_pcm[28 * 64];
+uint32_t g_dc_spu_smp_bytes, g_dc_spu_smp_fail;
+
+static int smp_in_use(int k)
+{
+    for (int i = 0; i < NV; i++) if (s_v[i].active && s_v[i].smp_i == k) return 1;
+    return 0;
+}
+static void smp_drop(int k)
+{
+    dc_host_snd_free(s_smp[k].aica);
+    g_dc_spu_smp_bytes -= s_smp[k].len * 2u;
+    memset(&s_smp[k], 0, sizeof s_smp[k]);
+}
+/* sound RAM changed: entries decoded from [a, a+len) are out of date */
+static void smp_dirty(uint32_t a, uint32_t len)
+{
+    if (s_hw != 1) return;
+    for (int k = 0; k < NSMP; k++) {
+        HwSmp* e = &s_smp[k];
+        if (!e->aica || e->stale || a >= e->end || a + len <= e->src) continue;
+        if (smp_in_use(k)) e->stale = 1; else smp_drop(k);
+    }
+}
+static int smp_get(uint32_t start, uint32_t rep_reg)
+{
+    /* walk the block flags: length, loop and loop point */
+    uint32_t a = start, nblk = 0; int loopblk = -1, loop = 0;
+    for (;;) {
+        uint8_t fl = g_dc_spu_ram[(a & (SPU_RAM_SIZE - 16u)) + 1];
+        if (fl & 4u) loopblk = (int)nblk;
+        nblk++;
+        a = (a + 16u) & (SPU_RAM_SIZE - 1u);
+        if (fl & 1u) { loop = (fl & 2u) != 0; break; }
+        if (nblk >= MAXBLK || a == start) break;
+    }
+    if (loop && loopblk < 0) {
+        if (rep_reg >= start && rep_reg < start + nblk * 16u) loopblk = (int)((rep_reg - start) >> 4);
+        else loop = 0;
+    }
+    uint32_t rep = loopblk >= 0 ? start + (uint32_t)loopblk * 16u : 0;
+    for (int k = 0; k < NSMP; k++) {
+        HwSmp* e = &s_smp[k];
+        if (e->aica && !e->stale && e->src == start && e->rep == rep && e->loop == loop) { e->used = ++s_smp_clock; return k; }
+    }
+    unsigned len = nblk * 28u;
+    /* a free entry and sound RAM, evicting the least recently used */
+    int slot = -1;
+    uint32_t off = 0;
+    for (;;) {
+        if (slot < 0) for (int k = 0; k < NSMP; k++) if (!s_smp[k].aica) { slot = k; break; }
+        if (slot >= 0) { off = dc_host_snd_alloc(len * 2u); if (off) break; }
+        int lru = -1;
+        for (int k = 0; k < NSMP; k++)
+            if (s_smp[k].aica && !smp_in_use(k) && (lru < 0 || s_smp[k].used < s_smp[lru].used)) lru = k;
+        if (lru < 0) { g_dc_spu_smp_fail++; return -1; }
+        smp_drop(lru);
+        if (slot < 0) slot = lru;
+    }
+    /* decode in chunks straight into the reserved sound RAM */
+    static const int f0[5] = {0, 60, 115, 98, 122}, f1[5] = {0, 0, -52, -55, -60};
+    int32_t h1 = 0, h2 = 0;
+    a = start;
+    for (uint32_t b = 0; b < nblk; ) {
+        unsigned nb = nblk - b > 64 ? 64 : nblk - b, o = 0;
+        for (unsigned j = 0; j < nb; j++, b++) {
+            const uint8_t* p = g_dc_spu_ram + (a & (SPU_RAM_SIZE - 16u));
+            int shift = p[0] & 15, filt = (p[0] >> 4) & 15;
+            if (filt > 4) filt = 0;
+            if (shift > 12) shift = 12;
+            for (int n = 0; n < 28; n++) {
+                int nib = (p[2 + (n >> 1)] >> ((n & 1) * 4)) & 15;
+                int32_t x = ((int32_t)(int16_t)((uint16_t)nib << 12) >> shift) + ((h1 * f0[filt] + h2 * f1[filt] + 32) >> 6);
+                x = clamp16(x); h2 = h1; h1 = x; s_pcm[o++] = (int16_t)x;
+            }
+            a = (a + 16u) & (SPU_RAM_SIZE - 1u);
+        }
+        dc_host_snd_write(off + (b - nb) * 56u, s_pcm, o);
+    }
+    HwSmp* e = &s_smp[slot];
+    e->src = start; e->end = start + nblk * 16u; e->rep = rep;
+    e->aica = off; e->len = (uint16_t)len; e->loop = (uint8_t)loop;
+    e->loopstart = (uint16_t)(loopblk >= 0 ? loopblk * 28 : 0);
+    e->stale = 0; e->used = ++s_smp_clock;
+    g_dc_spu_smp_bytes += len * 2u;
+    return slot;
+}
+
+/* Advance an envelope by n hardware samples without stepping each one. */
+static void adsr_advance(int i, Voice* v, uint32_t n)
+{
+    while (n) {
+        if (!v->cok) adsr_calc(i, v);
+        if (v->cdiv <= 0) return;
+        uint32_t need = (0x8000u - (v->adiv & 0x7FFFu) + (uint32_t)v->cdiv - 1u) / (uint32_t)v->cdiv;
+        if (need > n) { v->adiv += n * (uint32_t)v->cdiv; return; }
+        n -= need;
+        v->adiv = 0x8000u - (uint32_t)v->cdiv;   /* one step short: adsr_run takes the last one */
+        adsr_run(i, v);
+        if (v->adsr == REL && v->env == 0) return;
+    }
+}
+
+static inline uint32_t amp(int32_t x) { return (uint32_t)(x < 0 ? -x : x); }
+static void hw_out(int i, Voice* v, int on)
+{
+    int32_t ml = vol(REG(0x1F801D80u), &s_msw[0]), mr = vol(REG(0x1F801D82u), &s_msw[1]);
+    uint32_t l = amp(((int32_t)vol(vreg(i, 0), &s_vsw[i][0]) * (int32_t)v->env) >> 15);
+    uint32_t r = amp(((int32_t)vol(vreg(i, 1), &s_vsw[i][1]) * (int32_t)v->env) >> 15);
+    l = (l * amp(ml)) >> 15; r = (r * amp(mr)) >> 15;
+    if (!on) l = r = 0;
+    uint32_t loud = l > r ? l : r, quiet = l > r ? r : l;
+    unsigned vo = loud * 255u / 32767u, k = 0;
+    if (vo > 255) vo = 255;
+    /* AICA pan attenuates the quiet side in 3 dB steps */
+    if (quiet == 0) k = 15;
+    else { uint32_t q = quiet; while (k < 15 && q * 1413u / 1000u <= loud) { q = q * 1413u / 1000u; k++; } }
+    unsigned pan = k == 0 ? 128 : (l > r ? 127 - (k << 3) : 128 + (k << 3));
+    if (pan > 255) pan = 255;
+    uint32_t freq = ((vreg(i, 2) & 0x3FFFu) * 44100u) >> 12;
+    if (!freq) freq = 1;
+    if (vo != v->hw_vol || pan != v->hw_pan || freq != v->hw_freq) {
+        v->hw_vol = (uint16_t)vo; v->hw_pan = (uint16_t)pan; v->hw_freq = freq;
+        dc_host_snd_update(i, freq, vo, pan);
+    }
+}
+
+static void hw_stop(int i, Voice* v)
+{
+    if (v->hw_on) dc_host_snd_stop(i);
+    v->hw_on = 0;
+    if (v->smp_i >= 0 && s_smp[v->smp_i].stale) {
+        int k = v->smp_i; v->smp_i = -1;
+        if (!smp_in_use(k)) smp_drop(k);
+    }
+    v->smp_i = -1;
+}
+
+static void hw_key_on(int i, Voice* v)
+{
+    int k = smp_get(v->cur, v->rep);
+    v->smp_i = (int16_t)k;
+    if (k < 0) { v->active = 0; return; }
+    adsr_advance(i, v, 64);                  /* the attack's first ~1.5 ms */
+    v->hw_vol = 0xFFFF; v->hw_freq = 0;
+    hw_out(i, v, (REG(0x1F801DAAu) & 0x8000u) != 0);
+    HwSmp* e = &s_smp[k];
+    dc_host_snd_start(i, e->aica, e->len, e->loop, e->loopstart, v->hw_freq, v->hw_vol, v->hw_pan);
+    v->hw_on = 1;
+}
+
+/* n hardware samples have passed: envelopes, sweeps, play positions */
+static void hw_run(uint32_t n)
+{
+    int on = (REG(0x1F801DAAu) & 0x8000u) != 0;
+    if ((REG(0x1F801D80u) | REG(0x1F801D82u)) & 0x8000u)
+        for (uint32_t j = 0; j < n; j++) { sweep_step(&s_msw[0], REG(0x1F801D80u)); sweep_step(&s_msw[1], REG(0x1F801D82u)); }
+    for (int i = 0; i < NV; i++) {
+        Voice* v = &s_v[i];
+        if (!v->active) continue;
+        if ((vreg(i, 0) | vreg(i, 1)) & 0x8000u)
+            for (uint32_t j = 0; j < n; j++) { sweep_step(&s_vsw[i][0], vreg(i, 0)); sweep_step(&s_vsw[i][1], vreg(i, 1)); }
+        adsr_advance(i, v, n);
+        if (v->smp_i >= 0) {
+            HwSmp* e = &s_smp[v->smp_i];
+            v->pos += (uint64_t)n * (vreg(i, 2) & 0x3FFFu);
+            uint32_t p = (uint32_t)(v->pos >> 12);
+            if (p >= e->len) {
+                s_endx |= 1u << i;
+                if (!e->loop) { v->adsr = REL; v->env = 0; v->cok = 0; }
+                else { uint32_t ll = e->len - e->loopstart; if (!ll) ll = 1;
+                       v->pos = ((uint64_t)(e->loopstart + (p - e->len) % ll) << 12) | (v->pos & 0xFFFu); }
+            }
+        }
+        if (v->adsr == REL && v->env == 0) { v->active = 0; hw_stop(i, v); continue; }
+        hw_out(i, v, on);
+    }
+}
+
 static void key_on(uint32_t m)
 {
     for (int i = 0; i < NV; i++) {
         if (!(m & (1u << i))) continue;
         Voice* v = &s_v[i];
+        if (s_hw == 1 && v->smp_i >= 0) hw_stop(i, v);
+        else if (s_hw == 1 && v->hw_on) dc_host_snd_stop(i);
         memset(v, 0, sizeof *v);
+        v->smp_i = -1;
         v->active = 1;
         v->cur = ((uint32_t)(vreg(i, 3) & ~1u) << 3) & (SPU_RAM_SIZE - 1u);
         v->rep = ((uint32_t)(vreg(i, 7) & ~1u) << 3) & (SPU_RAM_SIZE - 1u);
         v->idx = 28;
         v->adsr = ATK;
         s_endx &= ~(1u << i);
+        if (s_hw == 1) hw_key_on(i, v);
     }
 }
 static void key_off(uint32_t m)
@@ -266,7 +474,7 @@ void dc_spu_cd_push(const int16_t* lr, unsigned frames, unsigned rate)
 
 /* ---------------------------------------------------------------- mixing */
 static int16_t s_out[1024 * 2];
-static uint64_t s_t0_us, s_done;          /* frames rendered since s_t0_us */
+static uint64_t s_t0_us, s_done, s_hw_t;          /* frames rendered since s_t0_us */
 uint32_t g_dc_spu_peak, g_dc_spu_keyons, g_dc_spu_us, g_dc_spu_frames;
 
 static int32_t s_acc[1024 * 2];
@@ -280,7 +488,7 @@ static void render(unsigned n)
     while (n) {
         unsigned m = n > 1024 ? 1024 : n;
         uint32_t act = 0;
-        if (on) for (int i = 0; i < NV; i++) if (s_v[i].active) act |= 1u << i;
+        if (on && s_hw != 1) for (int i = 0; i < NV; i++) if (s_v[i].active) act |= 1u << i;
         if (!act && s_cd_r == s_cd_w && !((REG(0x1F801D80u) | REG(0x1F801D82u)) & 0x8000u)) {
             memset(s_out, 0, m * 4u);          /* nothing playing: no per-sample work */
             dc_host_audio_push(s_out, m, RATE);
@@ -325,7 +533,15 @@ static void render(unsigned n)
 void dc_spu_tick(void)
 {
     uint64_t now = dc_host_ticks_us();
-    if (!s_t0_us) { s_t0_us = now; return; }
+    if (!s_t0_us) { s_t0_us = now; s_hw_t = now; if (s_hw < 0) s_hw = dc_host_snd_hw(); return; }
+    if (s_hw == 1) {
+        uint64_t hn = (now - s_hw_t) * 44100u / 1000000u;
+        if (hn) {
+            s_hw_t += hn * 1000000u / 44100u;
+            if (hn > 44100) hn = 44100;
+            hw_run((uint32_t)hn);
+        }
+    }
     uint64_t want = (now - s_t0_us) * RATE / 1000000u;
     if (want <= s_done) return;
     uint64_t n = want - s_done;
@@ -384,6 +600,7 @@ void dc_spu_write(uint32_t p, uint16_t v)
     case 0x1F801DA8u:
         irq_check(s_taddr, 2);
         memcpy(g_dc_spu_ram + (s_taddr & (SPU_RAM_SIZE - 2u)), &v, 2);
+        smp_dirty(s_taddr, 2);
         s_taddr = (s_taddr + 2u) & (SPU_RAM_SIZE - 1u);
         break;
     case 0x1F801DAAu: if (!(v & 0x40u)) s_irq_flag = 0; else irq_check(s_taddr, 2); break;
@@ -393,6 +610,7 @@ void dc_spu_write(uint32_t p, uint16_t v)
 /* DMA channel 4. to_spu: main RAM -> sound RAM. */
 void dc_spu_dma(uint8_t* ram, uint32_t madr, uint32_t words, int to_spu)
 {
+    if (to_spu) smp_dirty(s_taddr, words * 4u);
     for (uint32_t i = 0; i < words; i++, madr += 4) {
         irq_check(s_taddr, 4);
         uint8_t* m = ram + (madr & 0x1FFFFCu);
@@ -406,6 +624,7 @@ void dc_spu_reset(void)
 {
     memset(s_reg, 0, sizeof s_reg);
     memset(s_v, 0, sizeof s_v);
+    for (int i = 0; i < NV; i++) s_v[i].smp_i = -1;
     memset(s_vsw, 0, sizeof s_vsw);
     memset(s_msw, 0, sizeof s_msw);
     s_taddr = 0; s_endx = 0; s_irq_flag = 0;

@@ -230,3 +230,13 @@ void dc_host_audio_push(const int16_t* lr, unsigned frames, unsigned rate)
 {
     (void)lr; (void)frames; (void)rate;      /* no audio output on the Linux host yet */
 }
+
+int dc_host_snd_hw(void) { return 0; }
+uint32_t dc_host_snd_alloc(uint32_t bytes) { (void)bytes; return 0; }
+void dc_host_snd_write(uint32_t off, const int16_t* pcm, unsigned samples) { (void)off; (void)pcm; (void)samples; }
+void dc_host_snd_free(uint32_t off) { (void)off; }
+void dc_host_snd_start(int ch, uint32_t off, unsigned samples, int loop, unsigned loopstart,
+                       unsigned freq, unsigned vol, unsigned pan)
+{ (void)ch; (void)off; (void)samples; (void)loop; (void)loopstart; (void)freq; (void)vol; (void)pan; }
+void dc_host_snd_update(int ch, unsigned freq, unsigned vol, unsigned pan) { (void)ch; (void)freq; (void)vol; (void)pan; }
+void dc_host_snd_stop(int ch) { (void)ch; }
