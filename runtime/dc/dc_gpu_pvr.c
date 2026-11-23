@@ -26,6 +26,7 @@
  * subtractive blending.
  */
 #include "dc_gpu.h"
+#include "dc_runtime.h"
 #include <kos.h>
 #include <dc/pvr.h>
 #include <string.h>
@@ -649,6 +650,37 @@ void dc_gpu_hw_sync(int x, int y, int w, int h)
         scene_sync();
 }
 
+#ifdef DC_PERFHUD
+#include <dc/biosfont.h>
+extern char g_dc_hud_text[2][64]; extern volatile unsigned g_dc_hud_gen;
+static pvr_ptr_t s_hud_tex;
+static void hud_draw(void)
+{
+    pvr_ptr_t tex = s_hud_tex; static unsigned gen = ~0u;
+    static uint16_t buf[512 * 48] __attribute__((aligned(32)));
+    if (!tex) return;
+    if (gen != g_dc_hud_gen) {
+        gen = g_dc_hud_gen;
+        memset(buf, 0, sizeof buf);
+        for (int l = 0; l < 2; l++)
+            bfont_draw_str_ex(buf + l * 24 * 512, 512, 0xFFFFFF00u, 0xFF000000u, 16, true, g_dc_hud_text[l]);
+        sq_cpy(tex, buf, sizeof buf);
+    }
+    DcPrim p; memset(&p, 0, sizeof p);
+    p.n = 4; p.tex = 1; p.raw = 1; p.depth = 3;
+    send_header_ex(&p, tex, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, 512, 64);
+    const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
+    pvr_vertex_t vx;
+    for (int k = 0; k < 4; k++) {
+        vx.flags = k == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        vx.x = 8.0f + (float)(cx[k] * 384); vx.y = 8.0f + (float)(cy[k] * 48); vx.z = 1.0f;
+        vx.u = (float)(cx[k] * 384) * (1.0f / 512.0f);
+        vx.v = (float)(cy[k] * 48) * (1.0f / 64.0f);
+        vx.argb = 0xFFFFFFFFu; vx.oargb = 0;
+        ta_put(&vx, sizeof vx);
+    }
+}
+#endif
 static void scene_close(void)
 {
     if (!s_scene) return;
@@ -672,6 +704,9 @@ static void scene_close(void)
 #ifdef DC_PVR_SCENELOG
     { DcGpuDisplay d_; dc_gpu_display(&d_); char b[128]; snprintf(b, sizeof b, "[sc %u] at %d,%d prims %u bg %d disp %d,%d %dx%d en%d rtt%d\n", s_frame, s_ox, s_oy, s_prims, s_bg, d_.x, d_.y, d_.w, d_.h, d_.enabled, s_rtt_split); dbgio_write_str(b); }
 #endif
+#ifdef DC_PERFHUD
+    hud_draw();
+#endif
     ta_flush();
     pvr_list_finish();
     pvr_scene_finish();
@@ -693,7 +728,9 @@ static void show_vram_display(void)
 static int s_rf_n, s_rf_dymin = 9999, s_rf_dymax = -9999, s_rf_dxmin = 9999, s_rf_dxmax = -9999, s_rf_ymin = 9999, s_rf_ymax = -9999;
 #endif
 static unsigned s_vbl_since_flip = ~0u >> 1;
-void dc_gpu_hw_flip(void)
+static void dc_gpu_hw_flip_(void);
+void dc_gpu_hw_flip(void) { DC_PHASE(DC_PH_PVR); dc_gpu_hw_flip_(); DC_PHASE_END(); }
+static void dc_gpu_hw_flip_(void)
 {
     s_vbl_since_flip = 0;
 #ifdef DC_PVR_SCENELOG
@@ -757,7 +794,9 @@ static void show_depth24(const DcGpuDisplay* d)
 
 /* Called every VBlank: a game that draws without flipping still gets
    its picture shown. */
-void dc_gpu_pvr_vblank(void)
+static void dc_gpu_pvr_vblank_(void);
+void dc_gpu_pvr_vblank(void) { DC_PHASE(DC_PH_PVR); dc_gpu_pvr_vblank_(); DC_PHASE_END(); }
+static void dc_gpu_pvr_vblank_(void)
 {
     { DcGpuDisplay d; dc_gpu_display(&d);
       if (d.enabled && d.depth24) { if (!s_scene) show_depth24(&d); return; }
@@ -1104,6 +1143,11 @@ int dc_gpu_pvr_init(void)
     params.autosort_disabled = 1;       /* translucent list in submission order */
     params.opb_overflow_count = 3;
     if (pvr_init(&params) < 0) { dc_host_log("[pvr] pvr_init failed\n"); return -1; }
+    /* allocated first: the texture cache later takes what is left */
+    s_tex24 = pvr_mem_malloc(512 * 256 * 2);
+#ifdef DC_PERFHUD
+    s_hud_tex = pvr_mem_malloc(512 * 64 * 2);
+#endif
     pvr_set_bg_color(0, 0, 0);
     /* K = 1: render targets read as opaque 1555; no dithering, which would
        pile up in frames read back and drawn again */

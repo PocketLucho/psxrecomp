@@ -145,7 +145,14 @@ static void dma_finish(int ch)
 uint32_t dc_cd_fifo_read(uint8_t* dst, uint32_t n);
 uint32_t dc_gpu_load_words(const uint8_t* src, uint32_t n);
 
+static void dma_start_(int ch);
 static void dma_start(int ch)
+{
+    DC_PHASE(ch == 2 ? DC_PH_GPU : ch == 3 ? DC_PH_CD : ch == 4 ? DC_PH_SPU : ch <= 1 ? DC_PH_MDEC : g_dc_phase);
+    dma_start_(ch);
+    DC_PHASE_END();
+}
+static void dma_start_(int ch)
 {
     uint32_t madr = s_dma_madr[ch] & 0x1FFFFCu, bcr = s_dma_bcr[ch], chcr = s_dma_chcr[ch];
     if (ch == 0 || ch == 1) {            /* MDEC in / out */
@@ -550,13 +557,13 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
         return;
     }
     if (p >= 0x1F801800u && p < 0x1F801804u) { cd_write(p & 3, (uint8_t)v); return; }
-    if (p == 0x1F801810u) { dc_gpu_gp0(v); return; }
+    if (p == 0x1F801810u) { DC_PHASE(DC_PH_GPU); dc_gpu_gp0(v); DC_PHASE_END(); return; }
     if (p == 0x1F801820u || p == 0x1F801824u) {
         dc_mdec_write(p, v);
         if (s_dma1_wait) { s_dma1_wait = 0; dma_start(1); }
         return;
     }
-    if (p == 0x1F801814u) { dc_gpu_gp1(v); return; }
+    if (p == 0x1F801814u) { DC_PHASE(DC_PH_GPU); dc_gpu_gp1(v); DC_PHASE_END(); return; }
     if (p == 0x1FFE0130u) { s_cache_ctrl = v; return; }
     if (p >= 0x1F801C00u && p < 0x1F801E00u) {
         if (size == 1) return;

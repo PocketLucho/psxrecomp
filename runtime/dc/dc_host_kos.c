@@ -256,6 +256,12 @@ static void on_vblank(uint32_t code, void* data)
       irq_context_t* c = arch_irq_get_context();
       if (c && g_prof_n < 1024) { g_prof_pc[g_prof_n] = c->pc; g_prof_pr[g_prof_n] = c->pr; g_prof_n++; } }
 #endif
+#ifdef DC_PERFHUD
+    { extern unsigned g_dc_hud_cnt[DC_PH_N]; uint32_t dc_last_poll_pc(void);
+      unsigned ph = g_dc_phase;
+      if (ph == DC_PH_GAME && dc_last_poll_pc() - 0x8004B54Cu < 0x1E4u) ph = DC_PH_WAIT;   /* libetc VSync() */
+      if (ph < DC_PH_N) g_dc_hud_cnt[ph]++; }
+#endif
     g_irq_pending = 1;
 }
 
@@ -497,9 +503,37 @@ static void video_init(void)
 #ifdef DC_PROFILE
 uint32_t g_prof_pc[1024], g_prof_pr[1024]; volatile unsigned g_prof_n;
 #endif
+#ifdef DC_PERFHUD
+/* On-screen speed meter: once a second, the frames the game finished, the
+ * VBlanks it saw, and where the console spent its time (VBlank samples). */
+unsigned g_dc_hud_cnt[DC_PH_N];
+char g_dc_hud_text[2][64]; volatile unsigned g_dc_hud_gen;
+static void hud_update(const DcGpuDisplay* d)
+{
+    static unsigned polls, flips, last, lx = ~0u, ly = ~0u;
+    polls++;
+    if ((unsigned)d->x != lx || (unsigned)d->y != ly) { flips++; lx = (unsigned)d->x; ly = (unsigned)d->y; }
+    unsigned t = s_vblanks_total;
+    if (t - last < 60) return;
+    unsigned c[DC_PH_N], n = 0;
+    for (int i = 0; i < DC_PH_N; i++) { c[i] = g_dc_hud_cnt[i]; g_dc_hud_cnt[i] = 0; n += c[i]; }
+    if (!n) n = 1;
+#define P_(i) (c[i] * 100u / n)
+    snprintf(g_dc_hud_text[0], sizeof g_dc_hud_text[0], "FPS %2u  VBL %2u/%2u  CPU %3u%%", flips * 60u / (t - last), polls * 60u / (t - last), 60u,
+             100u - P_(DC_PH_WAIT));
+    snprintf(g_dc_hud_text[1], sizeof g_dc_hud_text[1], "J%2u E%2u G%2u P%2u S%2u C%2u M%2u I%2u",
+             P_(DC_PH_GAME), P_(DC_PH_WAIT), P_(DC_PH_GPU), P_(DC_PH_PVR), P_(DC_PH_SPU), P_(DC_PH_CD), P_(DC_PH_MDEC), P_(DC_PH_IRQ));
+#undef P_
+    g_dc_hud_gen++;
+    last = t; polls = flips = 0;
+}
+#endif
 static void perf_report(const DcGpuDisplay* d)
 {
     static unsigned polls, flips, last_total, lx = ~0u, ly = ~0u;
+#ifdef DC_PERFHUD
+    hud_update(d);
+#endif
     polls++;
     if ((unsigned)d->x != lx || (unsigned)d->y != ly) { flips++; lx = (unsigned)d->x; ly = (unsigned)d->y; }
     unsigned t = s_vblanks_total;

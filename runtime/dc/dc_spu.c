@@ -558,7 +558,9 @@ static void render(unsigned n)
 
 /* Render everything owed up to now. Called from the I/O poll and before any
  * write that changes what is playing. */
-void dc_spu_tick(void)
+static void dc_spu_tick_(void);
+void dc_spu_tick(void) { DC_PHASE(DC_PH_SPU); dc_spu_tick_(); DC_PHASE_END(); }
+static void dc_spu_tick_(void)
 {
     uint64_t now = dc_host_ticks_us();
     if (!s_t0_us) { s_t0_us = now; s_hw_t = now; if (s_hw < 0) s_hw = dc_host_snd_hw(); return; }

@@ -15,6 +15,8 @@ extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 
 /* Tiny sampling profile of the last dispatched address (host timer). */
 static volatile uint32_t s_last_poll_pc;
+volatile uint8_t g_dc_phase;
+uint32_t dc_last_poll_pc(void) { return s_last_poll_pc; }
 static uint32_t s_prof_addr[64], s_prof_hits[64];
 void dc_profile_sample(void)
 {
@@ -96,7 +98,9 @@ static void deliver_irq(CPUState* cpu)
     g_dc_stats.irqs++;
     CPUState saved = *cpu;
     s_in_irq = 1;
-    dc_bios_interrupt(cpu);
+    { DC_PHASE(DC_PH_IRQ);
+      dc_bios_interrupt(cpu);
+      DC_PHASE_END(); }
     s_in_irq = 0;
     /* The handler may have changed RAM, I_STAT, events and the critical-section
      * state; the interrupted context's registers come back unchanged. */

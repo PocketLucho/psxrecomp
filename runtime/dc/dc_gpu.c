@@ -385,13 +385,25 @@ static void rectangle(const uint32_t* w)
         if (dc_gpu_hw_prim(&p) == 1) return;
     }
     vram_touch(x, y, wdt, hgt);
-    for (int yy = 0; yy < hgt; yy++) {
-        int py = y + yy;
-        if (py < G.clip_y0 || py > G.clip_y1) continue;
-        for (int xx = 0; xx < wdt; xx++) {
-            int pxx = x + xx;
-            if (pxx < G.clip_x0 || pxx > G.clip_x1) continue;
-            shade_pixel(&s, pxx, py, r, g, b, fx ? u0 - xx : u0 + xx, fy ? v0 - yy : v0 + yy);
+    int xs = x < G.clip_x0 ? G.clip_x0 : x, xe = x + wdt - 1 > G.clip_x1 ? G.clip_x1 : x + wdt - 1;
+    int ys = y < G.clip_y0 ? G.clip_y0 : y, ye = y + hgt - 1 > G.clip_y1 ? G.clip_y1 : y + hgt - 1;
+    if (xs > xe || ys > ye) return;
+    SpanCtx sc;
+    span_setup(&sc, &s, r, g, b);
+    int mod = s.tex && !s.raw && (r != 128 || g != 128 || b != 128);
+    int mode = (s.tex ? 1 : 0) | (s.semi ? 4 : 0) | (mod ? 8 : 0);
+    int32_t dx[5] = {0, 0, 0, fx ? -65536 : 65536, 0};
+    int n = xe - xs + 1;
+    int32_t u_s = (fx ? u0 - (xs - x) : u0 + (xs - x)) * 65536;
+    for (int py = ys; py <= ye; py++) {
+        int yy = py - y;
+        int32_t at[5] = {0, 0, 0, u_s, (fy ? v0 - yy : v0 + yy) * 65536};
+        uint16_t* drow = &g_dc_vram[(py & 511) << 10];
+        switch (mode) {
+#define SPAN(T, SE, MO) case (T) | (SE) << 2 | (MO) << 3: \
+            span(&sc, drow, xs, n, at, dx, T, 0, SE, MO); break;
+        SPAN(0,0,0) SPAN(0,1,0) SPAN(1,0,0) SPAN(1,1,0) SPAN(1,0,1) SPAN(1,1,1)
+#undef SPAN
         }
     }
 }

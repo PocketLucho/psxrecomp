@@ -15,6 +15,19 @@ extern uint8_t g_dc_ram[0x200000];
 extern uint8_t g_dc_scratch[1024];
 extern volatile int g_irq_pending;
 
+/* What the console is doing, sampled at each VBlank by the on-screen speed
+ * meter of a DC_PERFHUD build: game code, the emulated GPU, the PowerVR
+ * submission, sound, CD, MDEC, the guest's interrupt handler. */
+enum { DC_PH_GAME, DC_PH_WAIT, DC_PH_GPU, DC_PH_PVR, DC_PH_SPU, DC_PH_CD, DC_PH_MDEC, DC_PH_IRQ, DC_PH_N };
+extern volatile uint8_t g_dc_phase;
+#ifdef DC_PERFHUD
+#define DC_PHASE(p) uint8_t dc_ph_old_ = g_dc_phase; g_dc_phase = (p)
+#define DC_PHASE_END() (g_dc_phase = dc_ph_old_)
+#else
+#define DC_PHASE(p) do { } while (0)
+#define DC_PHASE_END() do { } while (0)
+#endif
+
 static inline uint32_t dc_phys(uint32_t a) { return a & 0x1FFFFFFFu; }
 static inline uint8_t* dc_ram_ptr(uint32_t a) { return g_dc_ram + (dc_phys(a) & 0x1FFFFFu); }
 uint32_t dc_read32(uint32_t a);
