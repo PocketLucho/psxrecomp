@@ -194,40 +194,47 @@ static inline uint32_t gte_div(uint16_t h, uint16_t z, int* overflow)
 static void rtp_m(CPUState* cpu, Op* o, const int16_t m[3][3], const int64_t t12[3], int small_t, int n, int last)
 {
     const int32_t v0 = lo16(D(n * 2)), v1 = hi16(D(n * 2)), v2 = lo16(D(n * 2 + 1));
-    int64_t mac[3];
+    int32_t z12, ir1, ir2;
+    const int32_t lo = o->lm ? 0 : -0x8000;
+    uint32_t fl = 0;
     if (small_t && (uint32_t)(v0 + 0x2000) < 0x4000 && (uint32_t)(v1 + 0x2000) < 0x4000 && (uint32_t)(v2 + 0x2000) < 0x4000) {
-        /* |T| < 2^17 and |V| < 2^13: the sum stays under 2^31, so 32-bit
+        /* |T| < 2^17 and |V| < 2^13: the sums stay under 2^31, so 32-bit
            arithmetic is exact and no MAC overflow is possible */
+        const int32_t a0 = (int32_t)t12[0] + m[0][0] * v0 + m[0][1] * v1 + m[0][2] * v2;
+        const int32_t a1 = (int32_t)t12[1] + m[1][0] * v0 + m[1][1] * v1 + m[1][2] * v2;
+        const int32_t a2 = (int32_t)t12[2] + m[2][0] * v0 + m[2][1] * v1 + m[2][2] * v2;
+        const int sf = o->sf;
+        const int32_t m1 = a0 >> sf, m2 = a1 >> sf, m3 = a2 >> sf;
+        D(25) = (uint32_t)m1; D(26) = (uint32_t)m2; D(27) = (uint32_t)m3;
+        ir1 = m1 < lo ? (fl |= F_IR1, lo) : m1 > 0x7FFF ? (fl |= F_IR1, 0x7FFF) : m1;
+        ir2 = m2 < lo ? (fl |= F_IR2, lo) : m2 > 0x7FFF ? (fl |= F_IR2, 0x7FFF) : m2;
+        z12 = a2 >> 12;
+        D(11) = (uint32_t)(m3 < lo ? lo : m3 > 0x7FFF ? 0x7FFF : m3);
+    } else {
+        int64_t mac[3];
         for (int i = 0; i < 3; i++) {
-            int32_t a = (int32_t)t12[i] + m[i][0] * v0 + m[i][1] * v1 + m[i][2] * v2;
+            int64_t a = t12[i] + (int64_t)(m[i][0] * v0) + (int64_t)(m[i][1] * v1) + (int64_t)(m[i][2] * v2);
+            a = mac_fast(o, i + 1, a);
             mac[i] = a;
-            D(25 + i) = (uint32_t)(a >> o->sf);
+            D(25 + i) = (uint32_t)(int32_t)(a >> o->sf);
         }
-    } else
-    for (int i = 0; i < 3; i++) {
-        int64_t a = t12[i] + (int64_t)(m[i][0] * v0) + (int64_t)(m[i][1] * v1) + (int64_t)(m[i][2] * v2);
-        a = mac_fast(o, i + 1, a);
-        mac[i] = a;
-        D(25 + i) = (uint32_t)(int32_t)(a >> o->sf);
+        const int32_t m1 = (int32_t)D(25), m2 = (int32_t)D(26), m3 = (int32_t)D(27);
+        ir1 = m1 < lo ? (fl |= F_IR1, lo) : m1 > 0x7FFF ? (fl |= F_IR1, 0x7FFF) : m1;
+        ir2 = m2 < lo ? (fl |= F_IR2, lo) : m2 > 0x7FFF ? (fl |= F_IR2, 0x7FFF) : m2;
+        z12 = (int32_t)(mac[2] >> 12);      /* a 44-bit MAC fits */
+        D(11) = (uint32_t)(m3 < lo ? lo : m3 > 0x7FFF ? 0x7FFF : m3);
     }
-    set_ir(cpu, o, 1, (int32_t)D(25), o->lm);
-    set_ir(cpu, o, 2, (int32_t)D(26), o->lm);
+    D(9) = (uint32_t)ir1; D(10) = (uint32_t)ir2;
     /* IR3 flag is computed from MAC3 >> 12 regardless of sf (hardware quirk) */
-    {
-        int32_t z12 = (int32_t)(mac[2] >> 12);
-        int32_t v = (int32_t)D(27);
-        int32_t lo = o->lm ? 0 : -0x8000;
-        if (z12 < -0x8000 || z12 > 0x7FFF) o->flag |= F_IR3;
-        D(11) = (uint32_t)(int32_t)(v < lo ? lo : v > 0x7FFF ? 0x7FFF : v);
-    }
-    const int32_t z12 = (int32_t)(mac[2] >> 12);     /* a 44-bit MAC fits */
-    uint16_t z = z12 < 0 ? (o->flag |= F_SZ3, 0) : z12 > 0xFFFF ? (o->flag |= F_SZ3, 0xFFFF) : (uint16_t)z12;
-    push_sz(cpu, z);
+    if (z12 < -0x8000 || z12 > 0x7FFF) fl |= F_IR3;
+    uint16_t z = z12 < 0 ? (fl |= F_SZ3, 0) : z12 > 0xFFFF ? (fl |= F_SZ3, 0xFFFF) : (uint16_t)z12;
+    D(16) = D(17); D(17) = D(18); D(18) = D(19); D(19) = z;
     int overflow = 0;
     uint32_t q = gte_div((uint16_t)C(26), z, &overflow);
-    if (overflow) o->flag |= F_DIV;
-    int64_t sx = (int64_t)q * ir(cpu, 1) + (int32_t)C(24);
-    int64_t sy = (int64_t)q * ir(cpu, 2) + (int32_t)C(25);
+    if (overflow) fl |= F_DIV;
+    o->flag |= fl;
+    int64_t sx = (int64_t)(int32_t)q * ir1 + (int32_t)C(24);
+    int64_t sy = (int64_t)(int32_t)q * ir2 + (int32_t)C(25);
     push_sxy(cpu, o, (int32_t)(sx >> 16), (int32_t)(sy >> 16));
     if (last) {
         int64_t dq = (int64_t)(int16_t)C(27) * q + (int32_t)C(28);

@@ -833,11 +833,26 @@ static int reads_scene(const DcPrim* p)
     return overlaps(tx, ty, tw, th, s_ox, s_oy, d.w, fh);
 }
 
+/* Could the texture page touch a frame at all? Most pages sit away from
+   the frame buffers: then the exact texel rectangle is not needed. */
+static int page_near_frame(const DcPrim* p)
+{
+    if (!p->tex) return 0;
+    DcGpuDisplay d; dc_gpu_display(&d);
+    const int pw = p->depth == 0 ? 64 : p->depth == 1 ? 128 : 256;
+    const int tx = (int)p->tp_x, ty = (int)p->tp_y;
+    return overlaps(tx, ty, pw, 256, d.x, d.y, d.w, d.h) ||
+           overlaps(tx, ty, pw, 256, p->clip_x0, p->clip_y0, p->clip_x1 - p->clip_x0 + 1, p->clip_y1 - p->clip_y0 + 1) ||
+           (s_scene && overlaps(tx, ty, pw, 256, s_ox, s_oy, d.w, d.h)) ||
+           tx + pw > 1024;     /* wraps around */
+}
+
 int dc_gpu_hw_prim(const DcPrim* p)
 {
     if (!g_dc_pvr_on) return 0;
     int rtt = 0;
-    if (s_rtt && !s_soft_frames && reads_scene(p) && frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) {
+    const int near = page_near_frame(p);
+    if (near && s_rtt && !s_soft_frames && reads_scene(p) && frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) {
         s_rtt_hit = 1;
         if (!s_rtt_want) {
             /* first time: from the next frame on, render to texture; this
@@ -856,7 +871,7 @@ int dc_gpu_hw_prim(const DcPrim* p)
           dbgio_write_str(b); } }
 #endif
     }
-    if (!rtt && reads_frame(p) && frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) {
+    if (!rtt && near && reads_frame(p) && frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) {
         if (!s_soft_frames) dc_host_log("[pvr] frame buffer used as a texture: software frames\n");
 #ifdef DC_PVR_SCENELOG
         { int dy = p->v[0].y - ((int)p->tp_y + p->v[0].u * 0 + p->v[0].v), dx = p->v[0].x - ((int)p->tp_x + p->v[0].u);
@@ -879,7 +894,7 @@ int dc_gpu_hw_prim(const DcPrim* p)
     if (!frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) { g_dc_pvr_stat[1]++; return 0; }
     g_dc_pvr_stat[0]++;
 #ifdef DC_PVR_SCENELOG
-    if (s_frame >= 7300 && s_frame < 7302) { static int nl; if (nl < 3000) { nl++; char b[256];
+    if (p->tex && p->depth == 2 && p->tp_x >= 640 && p->tp_y == 256) { static int nl; if (nl < 400) { nl++; char b[256];
         snprintf(b, sizeof b, "[p5 %u] n=%d tex=%d d=%d tp=%u,%u clut=%u,%u semi=%d/%d v0=%d,%d uv0=%d,%d v3=%d,%d uv3=%d,%d c=%d,%d,%d raw=%d clip=%d,%d-%d,%d tw=%d,%d\n", s_frame, p->n, p->tex, p->depth,
                  p->tp_x, p->tp_y, p->clut_x, p->clut_y, p->semi, p->semi_mode, p->v[0].x, p->v[0].y, p->v[0].u, p->v[0].v, p->v[p->n-1].x, p->v[p->n-1].y, p->v[p->n-1].u, p->v[p->n-1].v, p->v[0].r, p->v[0].g, p->v[0].b, p->raw, p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1, p->tw_w, p->tw_h);
         dbgio_write_str(b); } }
