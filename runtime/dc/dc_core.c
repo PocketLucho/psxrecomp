@@ -70,6 +70,7 @@ void dc_fatal(const char* fmt, ...)
 }
 
 /* ---- interrupts -------------------------------------------------------- */
+unsigned dc_io_vblanks_owed(void);
 static int s_in_irq;
 static int s_in_irq_dbg(void) { return s_in_irq; }
 
@@ -95,7 +96,7 @@ static void deliver_irq(CPUState* cpu)
     uint32_t sr = cpu->cop0[12];
     *cpu = saved;
     cpu->cop0[12] = sr;
-    if (dc_io_istat() & dc_io_imask()) g_irq_pending = 1;
+    if ((dc_io_istat() & dc_io_imask()) || dc_io_vblanks_owed()) g_irq_pending = 1;
 }
 
 /* Called by generated code at back-edges when g_irq_pending is set. Services

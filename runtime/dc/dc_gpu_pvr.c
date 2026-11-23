@@ -65,6 +65,7 @@ static int s_bg;
 unsigned g_dc_pvr_stat[4];
 /* Frames left to draw in software: set when the game textures from a frame
    buffer (feedback effects), which the PowerVR's frames never reach. */
+unsigned g_dc_pvr_frame;
 static unsigned s_soft_frames;          /* prims drawn, prims declined, textures converted, scenes */
 
 /* Render to texture, for frames that texture from themselves (the heat
@@ -73,6 +74,10 @@ static unsigned s_soft_frames;          /* prims drawn, prims declined, textures
    scene is finished there and a new one shows s_rtt and the tiles over it. */
 #define RTT_W 1024
 #define RTT_H 512
+/* The PowerVR writes the render target in the display's pixel format, 0555
+   here (PM_RGB555), with bit 15 from FB_W_CTRL's K value, set to 1 at init:
+   read as ARGB1555 that is opaque. */
+#define RTT_FMT (PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED)
 static pvr_ptr_t s_rtt;
 static int s_rtt_want;              /* the last frames read themselves */
 static int s_rtt_scene;             /* the open scene renders into s_rtt */
@@ -81,7 +86,7 @@ static int s_rtt_hit;               /* this frame read itself */
 static unsigned s_rtt_idle;         /* frames since one read itself */
 
 /* ---- texture cache ------------------------------------------------------ */
-#define NTEX 24            /* at most; as many as fit in video memory */
+#define NTEX 28            /* at most; as many as fit in video memory */
 static int s_ntex;
 /* Full pages (banded) keep a stamp per 16-row band and the CLUT's block
    stamp and contents hash, so a write elsewhere on the page or in the CLUT
@@ -283,6 +288,9 @@ static pvr_ptr_t texture_for(const DcPrim* p)
     if (victim < 0) {               /* everything is in use: take the oldest */
         victim = 0;
         for (int i = 1; i < s_ntex; i++) if (s_tex[i].used < s_tex[victim].used) victim = i;
+#ifdef DC_PVR_SCENELOG
+        { static int nl; if (nl < 40) { nl++; char b[96]; snprintf(b, sizeof b, "[evict %u] slot %d used %u d=%d tp=%u,%u\n", s_frame, victim, s_tex[victim].used, depth, p->tp_x, p->tp_y); dbgio_write_str(b); } }
+#endif
     }
 #ifdef DC_PVR_TEXSTAT
     s_tstat[depth][victim >= 0 && s_tex[victim].key == key && s_tex[victim].win == win]++;
@@ -536,7 +544,7 @@ static void scene_open_ex(int ox, int oy, int cleared)
     s_rtt_split = 0; s_rtt_hit = 0;
     s_shadow = s_last_prims <= SHADOW_MAX;
     pvr_list_begin(PVR_LIST_TR_POLY);
-    s_scene = 1; s_hdr_key = ~0u; s_frame++; s_prims = 0; s_vblanks_open = 0;
+    s_scene = 1; s_hdr_key = ~0u; s_frame++; g_dc_pvr_frame = s_frame; s_prims = 0; s_vblanks_open = 0;
     s_ox = ox; s_oy = oy;
 #ifdef DC_PVR_TRACE
     if (oy == DC_PVR_TRACE && s_trace_left) { s_trace_on = 1; s_trace_left--; }
@@ -552,6 +560,35 @@ static void scene_open_ex(int ox, int oy, int cleared)
 
 static void send_header_ex(const DcPrim* p, pvr_ptr_t tex, uint32_t fmt, int tw, int th);
 
+/* ---- reading the PowerVR's picture back into VRAM ----------------------
+   Some effects copy the frame being drawn to elsewhere in VRAM (the screen
+   breaking apart at the end of the burning village copies it in strips and
+   draws them as quads). While such copies keep coming (s_sync), frames are
+   rendered to s_rtt and read back, halved, into the VRAM frame. */
+static unsigned s_sync;
+static void rtt_readback(void)
+{
+    pvr_wait_render_done();
+    DcGpuDisplay d; dc_gpu_display(&d);
+    int w = d.w > 0 ? d.w : 320, h = d.h > 0 ? d.h : 240;
+    const volatile uint16_t* src = (const volatile uint16_t*)s_rtt;
+    for (int y = 0; y < h; y++) {
+        const volatile uint16_t* row = src + (y * 480 / h) * RTT_W;
+        uint16_t* o = &g_dc_vram[((s_oy + y) & 511) << 10];
+        for (int x = 0; x < w; x++) {
+            uint16_t c = row[x * 640 / w];
+            o[(s_ox + x) & 1023] = (uint16_t)(((c >> 10) & 31) | (c & (31 << 5)) | ((c & 31) << 10));
+        }
+    }
+    mark_blocks(s_ox, s_oy, w, h, 0);
+    int bx0 = (s_ox & 1023) >> 6, bx1 = ((s_ox + w - 1) & 1023) >> 6;
+    int by0 = (s_oy & 511) >> 4, by1 = ((s_oy + h - 1) & 511) >> 4;
+    for (int by = by0;; by = (by + 1) & 31) {
+        for (int bx = bx0;; bx = (bx + 1) & 15) { g_dc_vram_gen[by][bx]++; if (bx == bx1) break; }
+        if (by == by1) break;
+    }
+}
+
 /* Finish the part of the frame rendered into s_rtt and start the visible
    scene from it. */
 static void rtt_split(void)
@@ -559,6 +596,7 @@ static void rtt_split(void)
     ta_flush();
     pvr_list_finish();
     pvr_scene_finish();
+    if (s_sync) rtt_readback();
     pvr_wait_ready();
     pvr_scene_begin();
     pvr_list_begin(PVR_LIST_TR_POLY);
@@ -566,7 +604,7 @@ static void rtt_split(void)
     DcPrim p;
     memset(&p, 0, sizeof p);
     p.tex = 1; p.raw = 1;
-    send_header_ex(&p, s_rtt, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, RTT_W, RTT_H);
+    send_header_ex(&p, s_rtt, RTT_FMT, RTT_W, RTT_H);
     const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
     pvr_vertex_t vx;
     for (int k = 0; k < 4; k++) {
@@ -579,9 +617,42 @@ static void rtt_split(void)
     }
 }
 
+/* The frame drawn so far, into VRAM, to go on rendering on top of it. */
+static void scene_sync(void)
+{
+    ta_flush();
+    pvr_list_finish();
+    pvr_scene_finish();
+    rtt_readback();
+    pvr_wait_ready();
+    pvr_scene_begin_rtt(s_rtt, 640, 480, RTT_W);
+    pvr_list_begin(PVR_LIST_TR_POLY);
+    s_hdr_key = ~0u;
+    DcGpuDisplay d; dc_gpu_display(&d);
+    blit(s_ox, s_oy, d.w > 0 ? d.w : 320, d.h > 0 ? d.h : 240);
+}
+
+static int overlaps(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh);
+void dc_gpu_hw_sync(int x, int y, int w, int h)
+{
+#ifndef DC_PVR_READBACK
+    /* off by default: in Flycast the frames read back come out scrambled
+       and the battle intro drops to ~4 fps; to be tried on hardware */
+    (void)x; (void)y; (void)w; (void)h; (void)scene_sync; return;
+#endif
+    if (!g_dc_pvr_on || s_soft_frames || !s_rtt || vram_true(x, y, w, h)) return;
+    if (!s_sync) dc_host_log("[pvr] frame copied in VRAM: reading frames back\n");
+    s_sync = 60;
+    s_rtt_want = 1; s_rtt_idle = 0;
+    DcGpuDisplay d; dc_gpu_display(&d);
+    if (s_scene && s_rtt_scene && overlaps(x, y, w, h, s_ox, s_oy, d.w > 0 ? d.w : 320, d.h > 0 ? d.h : 240))
+        scene_sync();
+}
+
 static void scene_close(void)
 {
     if (!s_scene) return;
+    if (s_sync) { s_sync--; s_rtt_idle = 0; }
     if (s_rtt_scene) rtt_split();       /* nothing read the frame after all */
     if (s_rtt_hit) s_rtt_idle = 0;
     else if (s_rtt_want && ++s_rtt_idle > 30) s_rtt_want = 0;
@@ -777,6 +848,13 @@ int dc_gpu_hw_prim(const DcPrim* p)
         if (s_rtt_scene) rtt_split();
         if (!s_rtt_split) { g_dc_pvr_stat[1]++; return 1; }
         rtt = 1;
+#ifdef DC_PVR_SCENELOG
+        { static int nl; if (nl < 120) { nl++; char b[200];
+          snprintf(b, sizeof b, "[rt %u] n=%d d=%d tp=%u,%u semi=%d/%d clip=%d,%d-%d,%d o=%d,%d v0=%d,%d uv0=%d,%d v1=%d,%d uv1=%d,%d tw=%d,%d\n", s_frame, p->n, p->depth,
+                   p->tp_x, p->tp_y, p->semi, p->semi_mode, p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1, s_ox, s_oy,
+                   p->v[0].x, p->v[0].y, p->v[0].u, p->v[0].v, p->v[p->n-1].x, p->v[p->n-1].y, p->v[p->n-1].u, p->v[p->n-1].v, p->tw_w, p->tw_h);
+          dbgio_write_str(b); } }
+#endif
     }
     if (!rtt && reads_frame(p) && frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) {
         if (!s_soft_frames) dc_host_log("[pvr] frame buffer used as a texture: software frames\n");
@@ -800,9 +878,15 @@ int dc_gpu_hw_prim(const DcPrim* p)
     if (s_soft_frames) { g_dc_pvr_stat[1]++; return 0; }
     if (!frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) { g_dc_pvr_stat[1]++; return 0; }
     g_dc_pvr_stat[0]++;
+#ifdef DC_PVR_SCENELOG
+    if (s_frame >= 7300 && s_frame < 7302) { static int nl; if (nl < 3000) { nl++; char b[256];
+        snprintf(b, sizeof b, "[p5 %u] n=%d tex=%d d=%d tp=%u,%u clut=%u,%u semi=%d/%d v0=%d,%d uv0=%d,%d v3=%d,%d uv3=%d,%d c=%d,%d,%d raw=%d clip=%d,%d-%d,%d tw=%d,%d\n", s_frame, p->n, p->tex, p->depth,
+                 p->tp_x, p->tp_y, p->clut_x, p->clut_y, p->semi, p->semi_mode, p->v[0].x, p->v[0].y, p->v[0].u, p->v[0].v, p->v[p->n-1].x, p->v[p->n-1].y, p->v[p->n-1].u, p->v[p->n-1].v, p->v[0].r, p->v[0].g, p->v[0].b, p->raw, p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1, p->tw_w, p->tw_h);
+        dbgio_write_str(b); } }
+#endif
     if (!s_scene) scene_open_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1);
     pvr_ptr_t tex = 0;
-    if (rtt) send_header_ex(p, s_rtt, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, RTT_W, RTT_H);
+    if (rtt) send_header_ex(p, s_rtt, RTT_FMT, RTT_W, RTT_H);
     else {
         int done = 0;
         if (p->tex && p->depth <= 1 && win_w(p) == 256 && win_h(p) == 256 && (p->depth ? s_npage8 : s_npage)) {
@@ -865,6 +949,9 @@ void dc_gpu_hw_fill(int x, int y, int w, int h, uint16_t c)
 {
     mark_blocks(x, y, w, h, 0);
     TRACE("[tr %u] fill %d,%d %dx%d c=%04x scene=%d\n", s_frame, x, y, w, h, c, s_scene);
+#ifdef DC_PVR_SCENELOG
+    if (s_frame >= 7300 && s_frame < 7302) { char b[96]; snprintf(b, sizeof b, "[f5 %u] fill %d,%d %dx%d c=%04x\n", s_frame, x, y, w, h, c); dbgio_write_str(b); }
+#endif
     if (!g_dc_pvr_on || s_soft_frames) return;
     if (!s_scene) {
         if (!frame_area(x, y, x + w - 1, y + h - 1)) return;
@@ -928,6 +1015,9 @@ void dc_gpu_hw_blit(int x, int y, int w, int h, int cx0, int cy0, int cx1, int c
 {
     mark_blocks(x, y, w, h, 0);
     TRACE("[tr %u] blit %d,%d %dx%d clip=%d,%d-%d,%d\n", s_frame, x, y, w, h, cx0, cy0, cx1, cy1);
+#ifdef DC_PVR_SCENELOG
+    if (s_frame >= 7300 && s_frame < 7302) { char b[96]; snprintf(b, sizeof b, "[b5 %u] blit %d,%d %dx%d scene=%d\n", s_frame, x, y, w, h, s_scene); dbgio_write_str(b); }
+#endif
     if (!g_dc_pvr_on || s_soft_frames || !frame_area(cx0, cy0, cx1, cy1)) return;
     /* only the part inside the drawing area */
     int x0 = x > cx0 ? x : cx0, y0 = y > cy0 ? y : cy0;
@@ -944,14 +1034,18 @@ int dc_gpu_pvr_init(void)
     pvr_init_params_t params;
     memset(&params, 0, sizeof params);
     params.opb_sizes[PVR_LIST_TR_POLY] = PVR_BINSIZE_32;
-    params.vertex_buf_size = 768 * 1024;   /* x2, double-buffered */
+    params.vertex_buf_size = 512 * 1024;   /* x2, double-buffered; ~3000 quads */
     params.autosort_disabled = 1;       /* translucent list in submission order */
     params.opb_overflow_count = 3;
     if (pvr_init(&params) < 0) { dc_host_log("[pvr] pvr_init failed\n"); return -1; }
     pvr_set_bg_color(0, 0, 0);
+    /* K = 1: render targets read as opaque 1555; no dithering, which would
+       pile up in frames read back and drawn again */
+    PVR_SET(PVR_FB_CFG_2, (PVR_GET(PVR_FB_CFG_2) | 0x8000) & ~8u);
     /* keep 256 KB free for the PowerVR's own use */
     pvr_ptr_t reserve = pvr_mem_malloc(256 * 1024);
     s_rtt = pvr_mem_malloc(RTT_W * RTT_H * 2);
+    { char b[64]; snprintf(b, sizeof b, "[pvr] rtt at %08x\n", (unsigned)(uintptr_t)s_rtt); dbgio_write_str(b); }
     pvr_set_pal_format(PVR_PAL_ARGB1555);
     for (int i = 0; i < 256; i++) {
         uint16_t t = 0;
@@ -960,24 +1054,22 @@ int dc_gpu_pvr_init(void)
     }
     for (int i = 0; i < NBANK4; i++) { s_bank[i].key = ~0u; s_bank[i].used = 0; }
     for (int i = 0; i < NBANK8; i++) { s_bank8[i].key = ~0u; s_bank8[i].used = 0; }
-    for (s_npage = 0; s_npage < NPAGE; s_npage++) {
-        if (pvr_mem_available() < 2 * 1024 * 1024) break;     /* leave room for the others */
-        s_page[s_npage].tex = pvr_mem_malloc(256 * 256 / 2);
-        if (!s_page[s_npage].tex) break;
-        s_page[s_npage].key = ~0u; s_page[s_npage].used = 0;
-    }
-    for (s_npage8 = 0; s_npage8 < NPAGE8; s_npage8++) {
-        if (pvr_mem_available() < 1536 * 1024) break;
-        s_page8[s_npage8].tex = pvr_mem_malloc(256 * 256);
-        if (!s_page8[s_npage8].tex) break;
-        s_page8[s_npage8].key = ~0u; s_page8[s_npage8].used = 0;
-    }
+    /* 1555 slots first: a frame of the Gear battle samples ~25 different
+       8-bit pages/CLUTs and 15-bit areas, and a slot drawn from earlier in
+       the frame cannot be replaced (the PowerVR draws at the end) */
     for (s_ntex = 0; s_ntex < NTEX; s_ntex++) {
-        if (pvr_mem_available() < 256 * 256 * 2 + 4096) break;
+        if (pvr_mem_available() < 1024 * 1024 + 256 * 256 * 2) break;    /* room for 4-bit pages */
         s_tex[s_ntex].tex = pvr_mem_malloc(256 * 256 * 2);
         if (!s_tex[s_ntex].tex) break;
         s_tex[s_ntex].key = ~0u; s_tex[s_ntex].used = 0;
     }
+    for (s_npage = 0; s_npage < NPAGE; s_npage++) {
+        if (pvr_mem_available() < 64 * 1024) break;
+        s_page[s_npage].tex = pvr_mem_malloc(256 * 256 / 2);
+        if (!s_page[s_npage].tex) break;
+        s_page[s_npage].key = ~0u; s_page[s_npage].used = 0;
+    }
+    s_npage8 = 0;
     if (reserve) pvr_mem_free(reserve);
     char b[80]; snprintf(b, sizeof b, "[pvr] %d texture slots, %d 4-bit pages, %d 8-bit pages\n", s_ntex, s_npage, s_npage8);
     dc_host_log(b);

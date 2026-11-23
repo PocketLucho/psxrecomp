@@ -210,9 +210,17 @@ void dc_cd_debug(char* b, unsigned n)
              (unsigned)s_cd_mode, (unsigned)dc_io_istat(), (unsigned)dc_io_imask());
 }
 
+/* VBlanks the host counted while the guest was busy are handed over one at
+ * a time, each once the guest has acknowledged the previous one: a game
+ * counting VBlanks (VSync(n) waits, frame timing) then keeps real time even
+ * when a poll comes late, instead of losing every VBlank but one. */
+static unsigned s_vbl_owed;
+unsigned dc_io_vblanks_owed(void) { return s_vbl_owed; }
 void dc_io_poll(void)
 {
-    if (dc_host_take_vblanks()) { dc_irq_raise(1u); dc_host_vblank(); }
+    s_vbl_owed += dc_host_take_vblanks();
+    if (s_vbl_owed > 8) s_vbl_owed = 8;      /* after a long stall (loading) */
+    if (s_vbl_owed && !(s_istat & 1u)) { s_vbl_owed--; dc_irq_raise(1u); dc_host_vblank(); }
     if (!s_cd_reading || s_cd_if != 0 || s_cd_npend) return;
     uint64_t now = dc_host_ticks_us();
     if (now < s_cd_next_us) return;
