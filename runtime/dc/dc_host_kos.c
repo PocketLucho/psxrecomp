@@ -35,7 +35,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Release builds keep the serial port silent (KOS banner included): every
+   byte out of it costs CPU time. Build with -DDC_LOG for the debug output. */
+#ifdef DC_LOG
 KOS_INIT_FLAGS(INIT_DEFAULT);
+#else
+KOS_INIT_FLAGS(INIT_DEFAULT | INIT_QUIET);
+#endif
 
 int dc_boot_exe(const void* exe, size_t size);
 
@@ -62,7 +68,11 @@ static void screen_line(const char* t)
 
 void dc_host_log(const char* s)
 {
+#ifdef DC_LOG
     dbgio_write_str(s);
+#else
+    if (g_dc_pvr_on) return;        /* nowhere to show it */
+#endif
     for (; *s; s++) {
         if (*s == '\n' || s_line_n == (int)sizeof s_line - 1) {
             s_line[s_line_n] = 0; screen_line(s_line); s_line_n = 0;
@@ -537,6 +547,7 @@ static void perf_report(const DcGpuDisplay* d)
     polls++;
     if ((unsigned)d->x != lx || (unsigned)d->y != ly) { flips++; lx = (unsigned)d->x; ly = (unsigned)d->y; }
     unsigned t = s_vblanks_total;
+#if defined(DC_LOG) || defined(DC_PROFILE)
     if (t - last_total >= 600) {
         char b[96];
         snprintf(b, sizeof b, "[perf] %u vblanks: guest saw %u, %u frames drawn\n", t - last_total, polls, flips);
@@ -555,6 +566,11 @@ static void perf_report(const DcGpuDisplay* d)
             dbgio_write_str(b);
             memset(g_dc_pvr_stat, 0, sizeof g_dc_pvr_stat);
         }
+#ifdef DC_LOG
+        { void dc_cd_debug(char*, unsigned); void dc_mdec_debug(char*, unsigned); int dc_dma1_debug(void);
+          char db[200]; dc_cd_debug(db, sizeof db); dbgio_write_str(db); dc_mdec_debug(db, sizeof db); dbgio_write_str(db);
+          snprintf(db, sizeof db, "[dma1] %d\n", dc_dma1_debug()); dbgio_write_str(db); }
+#endif
         last_total = t; polls = flips = 0;
 #ifdef DC_PROFILE
         unsigned n = g_prof_n;
@@ -565,6 +581,7 @@ static void perf_report(const DcGpuDisplay* d)
         g_prof_n = 0;
 #endif
     }
+#endif
 }
 
 void dc_host_vblank(void)

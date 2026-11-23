@@ -475,7 +475,23 @@ static void blit(int x, int y, int w, int h);
    picture without clearing it (the title menu) then get that picture back
    as the background of the next frame. Heavy 3D frames redraw everything
    and are left to the PowerVR alone. */
-#define SHADOW_MAX 96
+/* Light frames used to be drawn in software as well (SHADOW_MAX prims or
+   fewer), so VRAM kept a true copy for games that draw over the previous
+   picture (the title menu over the logo). That made text screens 3x slower,
+   so by default everything is left to the PowerVR (SHADOW_MAX 0); the title
+   menu then loses its background. -DSHADOW_MAX=96 restores the old way.
+   DC_PVR_FEEDBACK renders every frame into s_rtt and starts a frame the
+   game did not clear from the previous picture: work in progress (in Flycast
+   the title menu still comes out without its logo). */
+#ifdef DC_PVR_FEEDBACK
+#define PVR_FEEDBACK 1
+#else
+#define PVR_FEEDBACK 0
+#endif
+#ifndef SHADOW_MAX
+#define SHADOW_MAX 0
+#endif
+static int s_rtt_valid;             /* s_rtt holds the whole last frame */
 /* Frames are drawn in software too only while they stay light: a frame
    after a heavy one is taken for heavy from the start. */
 static int s_shadow = 1;
@@ -531,15 +547,17 @@ static int fit_axis(int disp, int size, int a0, int a1)
     if (disp + size - 1 > a1) return a1 - size + 1;
     return disp;
 }
-static void scene_open_area(int x0, int y0, int x1, int y1)
+static void scene_open_area_ex(int x0, int y0, int x1, int y1, int cleared)
 {
     DcGpuDisplay d; dc_gpu_display(&d);
-    scene_open_ex(fit_axis(d.x, d.w, x0, x1), fit_axis(d.y, d.h, y0, y1), 1);
+    scene_open_ex(fit_axis(d.x, d.w, x0, x1), fit_axis(d.y, d.h, y0, y1), cleared);
 }
+static void scene_open_area(int x0, int y0, int x1, int y1) { scene_open_area_ex(x0, y0, x1, y1, 1); }
+static void rtt_quad(void);
 static void scene_open_ex(int ox, int oy, int cleared)
 {
     pvr_wait_ready();
-    s_rtt_scene = s_rtt && s_rtt_want;
+    s_rtt_scene = s_rtt && (s_rtt_want || PVR_FEEDBACK);
     if (s_rtt_scene) pvr_scene_begin_rtt(s_rtt, 640, 480, RTT_W);
     else pvr_scene_begin();
     s_rtt_split = 0; s_rtt_hit = 0;
@@ -557,6 +575,7 @@ static void scene_open_ex(int ox, int oy, int cleared)
     int ok = !cleared && vram_true(ox, oy, bw, bh);
     s_bg = cleared ? 0 : ok ? 2 : 1;
     if (ok) blit(ox, oy, d.w > 0 ? d.w : 320, d.h > 0 ? d.h : 240);
+    else if (!cleared && s_rtt_scene && s_rtt_valid) { rtt_quad(); s_bg = 4; }
 }
 
 static void send_header_ex(const DcPrim* p, pvr_ptr_t tex, uint32_t fmt, int tw, int th);
@@ -602,6 +621,12 @@ static void rtt_split(void)
     pvr_scene_begin();
     pvr_list_begin(PVR_LIST_TR_POLY);
     s_rtt_scene = 0; s_rtt_split = 1; s_hdr_key = ~0u;
+    rtt_quad();
+}
+
+/* s_rtt over the whole screen, texel for pixel. */
+static void rtt_quad(void)
+{
     DcPrim p;
     memset(&p, 0, sizeof p);
     p.tex = 1; p.raw = 1;
@@ -685,6 +710,7 @@ static void scene_close(void)
 {
     if (!s_scene) return;
     if (s_sync) { s_sync--; s_rtt_idle = 0; }
+    s_rtt_valid = s_rtt_scene;          /* the whole frame went to s_rtt */
     if (s_rtt_scene) rtt_split();       /* nothing read the frame after all */
     if (s_rtt_hit) s_rtt_idle = 0;
     else if (s_rtt_want && ++s_rtt_idle > 30) s_rtt_want = 0;
@@ -989,7 +1015,7 @@ int dc_gpu_hw_prim(const DcPrim* p)
                  p->tp_x, p->tp_y, p->clut_x, p->clut_y, p->semi, p->semi_mode, p->v[0].x, p->v[0].y, p->v[0].u, p->v[0].v, p->v[p->n-1].x, p->v[p->n-1].y, p->v[p->n-1].u, p->v[p->n-1].v, p->v[0].r, p->v[0].g, p->v[0].b, p->raw, p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1, p->tw_w, p->tw_h);
         dbgio_write_str(b); } }
 #endif
-    if (!s_scene) scene_open_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1);
+    if (!s_scene) scene_open_area_ex(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1, !PVR_FEEDBACK);
     pvr_ptr_t tex = 0;
     if (rtt) send_header_ex(p, s_rtt, RTT_FMT, RTT_W, RTT_H);
     else {
@@ -1055,7 +1081,6 @@ void dc_gpu_hw_fill(int x, int y, int w, int h, uint16_t c)
     mark_blocks(x, y, w, h, 0);
     TRACE("[tr %u] fill %d,%d %dx%d c=%04x scene=%d\n", s_frame, x, y, w, h, c, s_scene);
 #ifdef DC_PVR_SCENELOG
-    if (s_frame >= 7300 && s_frame < 7302) { char b[96]; snprintf(b, sizeof b, "[f5 %u] fill %d,%d %dx%d c=%04x\n", s_frame, x, y, w, h, c); dbgio_write_str(b); }
 #endif
     if (!g_dc_pvr_on || s_soft_frames) return;
     if (!s_scene) {
@@ -1121,7 +1146,6 @@ void dc_gpu_hw_blit(int x, int y, int w, int h, int cx0, int cy0, int cx1, int c
     mark_blocks(x, y, w, h, 0);
     TRACE("[tr %u] blit %d,%d %dx%d clip=%d,%d-%d,%d\n", s_frame, x, y, w, h, cx0, cy0, cx1, cy1);
 #ifdef DC_PVR_SCENELOG
-    if (s_frame >= 7300 && s_frame < 7302) { char b[96]; snprintf(b, sizeof b, "[b5 %u] blit %d,%d %dx%d scene=%d\n", s_frame, x, y, w, h, s_scene); dbgio_write_str(b); }
 #endif
     if (!g_dc_pvr_on || s_soft_frames || !frame_area(cx0, cy0, cx1, cy1)) return;
     /* only the part inside the drawing area */

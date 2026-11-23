@@ -496,7 +496,6 @@ static void execute(const uint32_t* w, int n)
         int sx = w[1] & 0x3FF, sy = (w[1] >> 16) & 0x1FF, dx = w[2] & 0x3FF, dy = (w[2] >> 16) & 0x1FF;
         int ww = ((w[3] - 1) & 0x3FF) + 1, hh = (((w[3] >> 16) - 1) & 0x1FF) + 1;
 #ifdef DC_PVR_SCENELOG
-        { extern unsigned g_dc_pvr_frame; static int nl; if (g_dc_pvr_frame > 7100 && nl < 400) { nl++; char b[96]; snprintf(b, sizeof b, "[cp] %d,%d -> %d,%d %dx%d\n", sx, sy, dx, dy, ww, hh); dc_host_log(b); } }
 #endif
         dc_gpu_hw_sync(sx, sy, ww, hh);     /* the source may be drawn by the PowerVR */
         vram_touch(dx, dy, ww, hh);
@@ -522,7 +521,6 @@ static void execute(const uint32_t* w, int n)
         G.store_i = 0; G.store_n = G.store_w * G.store_h; G.store_active = 1;
         dc_gpu_hw_sync(G.store_x, G.store_y, G.store_w, G.store_h);
 #ifdef DC_PVR_SCENELOG
-        { extern unsigned g_dc_pvr_frame; static int nl; if (g_dc_pvr_frame > 7100 && nl < 200) { nl++; char b[96]; snprintf(b, sizeof b, "[rd] %d,%d %dx%d\n", G.store_x, G.store_y, G.store_w, G.store_h); dc_host_log(b); } }
 #endif
         return;
     default:

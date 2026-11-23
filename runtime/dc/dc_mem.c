@@ -344,6 +344,7 @@ static void cd_ack(uint8_t bits)
 /* Called from the interrupt path: deliver the next sector of a running read
  * once the drive would have it (75 sectors/s, 150 at double speed). */
 static uint64_t s_cd_next_us;
+int dc_dma1_debug(void) { return s_dma1_wait * 2 + (s_dma1_due != 0); }
 void dc_cd_debug(char* b, unsigned n)
 {
     snprintf(b, n, "[cd-state] if=%02X ie=%02X reading=%d npend=%d ready=%d lba=%u mode=%02X istat=%03X imask=%03X\n",

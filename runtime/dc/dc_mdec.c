@@ -11,6 +11,13 @@
 #include <string.h>
 #include <stdio.h>
 void dc_host_log(const char* s);
+/* The FTRV IDCT is about 1.6x faster per block, but a faster MDEC lets the
+   movie player run ahead of the CD ring at the end of the title movie
+   (a race in the CD/ring timing still to be fixed), so it is opt-in. */
+#if defined(_arch_dreamcast) && defined(DC_MDEC_FTRV)
+#include <dc/matrix.h>
+#define MDEC_FTRV 1
+#endif
 
 static const uint8_t s_zz[64] = {
     0x00, 0x08, 0x01, 0x02, 0x09, 0x10, 0x18, 0x11, 0x0a, 0x03, 0x04, 0x0b, 0x12, 0x19, 0x20, 0x28,
@@ -67,24 +74,100 @@ static inline void pass(const int16_t* s, int16_t* o, int c, int last)
     }
 }
 
+#ifdef MDEC_FTRV
+/* The IDCT as 4x4 matrix products on the SH4's vector unit (FTRV): each
+ * 1-D pass is the 8x8 cosine table split into four 4x4 blocks. Float keeps
+ * 24 bits, so an output can differ from the integer IDCT by one step where
+ * the integer sum sits exactly on a rounding boundary; a self-test against
+ * the integer path decides whether it is used. */
+static matrix_t s_m[2][2] __attribute__((aligned(32)));   /* [out half][in half] */
+static int s_ftrv;
+static inline int rnd(float v) { return (int)(v + 32768.5f) - 32768; }
+#define FTRV4(a, b, c, d, o, ADD) do { \
+    register float x0_ __asm__("fr0") = (a), x1_ __asm__("fr1") = (b), x2_ __asm__("fr2") = (c), x3_ __asm__("fr3") = (d); \
+    __asm__ __volatile__("ftrv xmtrx,fv0" : "+f"(x0_), "+f"(x1_), "+f"(x2_), "+f"(x3_)); \
+    if (ADD) { (o)[0] += x0_; (o)[1] += x1_; (o)[2] += x2_; (o)[3] += x3_; } \
+    else { (o)[0] = x0_; (o)[1] = x1_; (o)[2] = x2_; (o)[3] = x3_; } } while (0)
+/* acc[c][x] = sum_j in[c][j] * sc[x][j] for the rows c set in nz */
+static void pass_ftrv(const float in[8][8], float acc[8][8], unsigned nz)
+{
+    for (int h = 0; h < 2; h++) {
+        mat_load(&s_m[h][0]);
+        for (int c = 0; c < 8; c++)
+            if (nz >> c & 1) { const float* r = in[c]; FTRV4(r[0], r[1], r[2], r[3], acc[c] + h * 4, 0); }
+        mat_load(&s_m[h][1]);
+        for (int c = 0; c < 8; c++)
+            if (nz >> c & 1) { const float* r = in[c] + 4; FTRV4(r[0], r[1], r[2], r[3], acc[c] + h * 4, 1); }
+    }
+}
+static void idct_ftrv(int16_t* b)
+{
+    float in[8][8] __attribute__((aligned(8))), acc[8][8] __attribute__((aligned(8)));
+    unsigned nz = 0;
+    for (int c = 0; c < 8; c++) {
+        const int16_t* r = b + c * 8;
+        if (!(r[0] | r[1] | r[2] | r[3] | r[4] | r[5] | r[6] | r[7])) continue;
+        nz |= 1u << c;
+        for (int j = 0; j < 8; j++) in[c][j] = (float)r[j];
+    }
+    pass_ftrv(in, acc, nz);
+    /* the first pass rounds to integers, as the hardware does; its output is
+       transposed (t[x*8 + c]), and every row of it is in use */
+    for (int c = 0; c < 8; c++)
+        if (nz >> c & 1) for (int x = 0; x < 8; x++) in[x][c] = (float)rnd(acc[c][x]);
+        else for (int x = 0; x < 8; x++) in[x][c] = 0.0f;
+    pass_ftrv(in, acc, 0xFFu);
+    for (int c = 0; c < 8; c++)
+        for (int x = 0; x < 8; x++) b[c * 8 + x] = (int16_t)m9c(rnd(acc[c][x]));
+}
+#endif
+
+static void idct_int(int16_t* b);
 static void check_sym(void)
 {
     s_sym = 1;
     for (int x = 0; x < 4; x++)
         for (int j = 0; j < 8; j++)
             if (M.sc[(7 - x) * 8 + j] != ((j & 1) ? -M.sc[x * 8 + j] : M.sc[x * 8 + j])) s_sym = 0;
+#ifdef MDEC_FTRV
+    s_ftrv = 0;
+    /* matrix_t is column-major: m[j][x] multiplies input j into output x */
+    for (int h = 0; h < 2; h++)
+        for (int g = 0; g < 2; g++)
+            for (int x = 0; x < 4; x++)
+                for (int j = 0; j < 4; j++)
+                    s_m[h][g][j][x] = (float)M.sc[(h * 4 + x) * 8 + g * 4 + j] * (1.0f / 32768.0f);
+    int bad = 0;
+    uint32_t seed = 12345;
+    for (int n = 0; n < 64 && !bad; n++) {
+        int16_t a[64], f[64];
+        for (int i = 0; i < 64; i++) {
+            seed = seed * 1103515245u + 12345u;
+            int v = (int)((seed >> 16) & 0x7FFF) - 0x4000;
+            a[i] = (int16_t)(i == 0 || (seed >> 8) % 5 == 0 ? v >> (n & 7) : 0);
+        }
+        memcpy(f, a, sizeof a);
+        idct_int(a);
+        idct_ftrv(f);
+        for (int i = 0; i < 64; i++) if (abs(a[i] - f[i]) > 1) bad = 1;
+    }
+    s_ftrv = !bad;
+    { static int said; if (!said) { said = 1; dc_host_log(s_ftrv ? "[mdec] IDCT on FTRV\n" : "[mdec] IDCT on integers (FTRV self-test failed)\n");
+#ifdef DC_MDEC_BENCH
+      { uint64_t dc_host_ticks_us(void); int16_t a[64]; char b[80];
+        for (int i = 0; i < 64; i++) a[i] = (int16_t)((i * 37) % 200 - 100);
+        uint64_t t0 = dc_host_ticks_us(); for (int k = 0; k < 2000; k++) { a[0] = (int16_t)k; idct_int(a); }
+        uint64_t t1 = dc_host_ticks_us(); for (int k = 0; k < 2000; k++) { a[0] = (int16_t)k; idct_ftrv(a); }
+        uint64_t t2 = dc_host_ticks_us();
+        snprintf(b, sizeof b, "[mdec] 2000 IDCTs: int %u us, ftrv %u us\n", (unsigned)(t1 - t0), (unsigned)(t2 - t1)); dc_host_log(b); }
+#endif
+    } }
+#endif
 }
 
-static void idct(int16_t* b, int ac)
+static void idct_int(int16_t* b)
 {
     int16_t t[64];
-    if (!ac) {
-        int16_t t0[8];
-        for (int x = 0; x < 8; x++) t0[x] = (int16_t)((b[0] * M.sc[x * 8] + 0x4000) >> 15);
-        for (int c = 0; c < 8; c++)
-            for (int x = 0; x < 8; x++) b[c * 8 + x] = (int16_t)m9c((t0[c] * M.sc[x * 8] + 0x4000) >> 15);
-        return;
-    }
     for (int c = 0; c < 8; c++) {
         const int16_t* s = b + c * 8;
         if (!(s[0] | s[1] | s[2] | s[3] | s[4] | s[5] | s[6] | s[7])) {
@@ -101,6 +184,21 @@ static void idct(int16_t* b, int ac)
         }
         pass(s, b, c, 1);
     }
+}
+
+static void idct(int16_t* b, int ac)
+{
+    if (!ac) {
+        int16_t t0[8];
+        for (int x = 0; x < 8; x++) t0[x] = (int16_t)((b[0] * M.sc[x * 8] + 0x4000) >> 15);
+        for (int c = 0; c < 8; c++)
+            for (int x = 0; x < 8; x++) b[c * 8 + x] = (int16_t)m9c((t0[c] * M.sc[x * 8] + 0x4000) >> 15);
+        return;
+    }
+#ifdef MDEC_FTRV
+    if (s_ftrv) { idct_ftrv(b); return; }
+#endif
+    idct_int(b);
 }
 
 static int block(int16_t* b, const uint8_t* q)
@@ -331,3 +429,11 @@ int dc_mdec_dma_out(uint8_t* ram, uint32_t madr, uint32_t words)
     return 1;
 }
 
+
+#ifdef DC_LOG
+void dc_mdec_debug(char* b, unsigned n)
+{
+    snprintf(b, n, "[mdec-state] cmd=%08X busy=%d need=%u cnt=%u live=%d pos=%u end=%u olen=%u opos=%u\n",
+             (unsigned)M.cmd, M.busy, (unsigned)M.need, (unsigned)M.cnt, M.live, (unsigned)M.pos, (unsigned)M.end, (unsigned)M.olen, (unsigned)M.opos);
+}
+#endif
