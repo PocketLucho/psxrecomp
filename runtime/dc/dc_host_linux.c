@@ -240,3 +240,5 @@ void dc_host_snd_start(int ch, uint32_t off, unsigned samples, int loop, unsigne
 { (void)ch; (void)off; (void)samples; (void)loop; (void)loopstart; (void)freq; (void)vol; (void)pan; }
 void dc_host_snd_update(int ch, unsigned freq, unsigned vol, unsigned pan) { (void)ch; (void)freq; (void)vol; (void)pan; }
 void dc_host_snd_stop(int ch) { (void)ch; }
+void dc_host_snd_reverb(unsigned level) { (void)level; }
+void dc_host_snd_send(int ch, unsigned level) { (void)ch; (void)level; }

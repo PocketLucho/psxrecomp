@@ -379,13 +379,41 @@ static void hw_key_on(int i, Voice* v)
     hw_out(i, v, (REG(0x1F801DAAu) & 0x8000u) != 0);
     HwSmp* e = &s_smp[k];
     dc_host_snd_start(i, e->aica, e->len, e->loop, e->loopstart, v->hw_freq, v->hw_vol, v->hw_pan);
+    uint32_t eon = (uint32_t)REG(0x1F801D98u) | ((uint32_t)REG(0x1F801D9Au) << 16);
+    { static unsigned nlog; if (eon && nlog++ < 8) { char t[64]; snprintf(t, sizeof t, "[rev] key-on v%d eon %06X\n", i, (unsigned)eon); dc_host_log(t); } }
+#ifdef DC_REV_ALL
+    eon = ~0u;
+#endif
+    dc_host_snd_send(i, (eon >> i) & 1u ? 15u : 0u);
     v->hw_on = 1;
 }
 
 /* n hardware samples have passed: envelopes, sweeps, play positions */
+/* reverb return level, in the AICA's 3 dB steps, from the PS1 reverb
+ * output volume (and off while the game has reverb disabled) */
+static unsigned s_rev_lvl = 99;
+static void hw_reverb(void)
+{
+    uint32_t a = amp((int16_t)REG(0x1F801D84u)), b = amp((int16_t)REG(0x1F801D86u));
+    uint32_t m = a > b ? a : b;
+    unsigned lvl = 0;
+    if ((REG(0x1F801DAAu) & 0x80u) && m) {
+        lvl = 15;
+        uint32_t t = 0x7FFF;
+        while (lvl > 1 && m * 1413u / 1000u < t) { t = t * 1000u / 1413u; lvl--; }
+    }
+    if (lvl != s_rev_lvl) {
+        char t[96]; snprintf(t, sizeof t, "[rev] level %u (cnt %04X vout %04X/%04X eon %04X)\n", lvl, REG(0x1F801DAAu),
+                             REG(0x1F801D84u), REG(0x1F801D86u), REG(0x1F801D98u));
+        dc_host_log(t);
+        s_rev_lvl = lvl; dc_host_snd_reverb(lvl);
+    }
+}
+
 static void hw_run(uint32_t n)
 {
     int on = (REG(0x1F801DAAu) & 0x8000u) != 0;
+    hw_reverb();
     if ((REG(0x1F801D80u) | REG(0x1F801D82u)) & 0x8000u)
         for (uint32_t j = 0; j < n; j++) { sweep_step(&s_msw[0], REG(0x1F801D80u)); sweep_step(&s_msw[1], REG(0x1F801D82u)); }
     for (int i = 0; i < NV; i++) {

@@ -28,6 +28,7 @@
 #include <dc/sound/aica_comm.h>
 #include <dc/spu.h>
 #include <dc/sound/sfxmgr.h>
+#include <dc/g2bus.h>
 #include <arch/timer.h>
 #include <arch/cache.h>
 #include <stdio.h>
@@ -392,6 +393,88 @@ void dc_host_snd_start(int ch, uint32_t off, unsigned samples, int loop, unsigne
 void dc_host_snd_update(int ch, unsigned freq, unsigned vol, unsigned pan)
 { snd_chan_cmd(ch, AICA_CH_CMD_UPDATE | AICA_CH_UPDATE_SET_FREQ | AICA_CH_UPDATE_SET_VOL | AICA_CH_UPDATE_SET_PAN, 0, 0, 0, 0, freq, vol, pan); }
 void dc_host_snd_stop(int ch) { snd_chan_cmd(ch, AICA_CH_CMD_STOP, 0, 0, 0, 0, 44100, 0, 0); }
+
+/* ---- AICA effects DSP: a small stereo reverb -----------------------------
+ * The PS1 reverb is approximated with four feedback delay lines (combs) fed
+ * from DSP mix input 0: voices send to it with their channel's IMXL level,
+ * combs 1+3 come out on EFREG0 (left) and 2+4 on EFREG1 (right). The ring
+ * buffer is 8 K words of sound RAM. Step layout: reads on odd steps land in
+ * MEMS two steps later; a value written to memory, TEMP or EFREG is the
+ * accumulator of the step before. */
+#define AICA_REG(o) (0xA0700000u + (o))
+static int s_rev_up;
+static uint32_t mpro_word(int w, unsigned tra, int twt, unsigned twa, int xsel, unsigned ysel, unsigned ira,
+                          int iwt, unsigned iwa, int mwt, int mrd, int ewt, unsigned ewa, int zero, int bsel, unsigned masa)
+{
+    switch (w) {
+    case 0: return (tra << 9) | ((unsigned)twt << 8) | (twa << 1);
+    case 1: return ((unsigned)xsel << 15) | (ysel << 13) | (ira << 7) | ((unsigned)iwt << 6) | (iwa << 1);
+    case 2: return ((unsigned)mwt << 14) | ((unsigned)mrd << 13) | ((unsigned)ewt << 12) | (ewa << 8) | ((unsigned)zero << 1) | (unsigned)bsel;
+    default: return masa << 9;
+    }
+}
+static void rev_setup(void)
+{
+    static const int dly[4] = {1557, 1617, 1491, 1422};
+    uint32_t mpro[128][4];
+    int16_t coef[128];
+    memset(mpro, 0, sizeof mpro); memset(coef, 0, sizeof coef);
+#define STEP(s, tra, twt, twa, xsel, ysel, ira, iwt, iwa, mwt, mrd, ewt, ewa, zero, bsel, masa) \
+    for (int w = 0; w < 4; w++) mpro[s][w] = mpro_word(w, tra, twt, twa, xsel, ysel, ira, iwt, iwa, mwt, mrd, ewt, ewa, zero, bsel, masa)
+    const int16_t gi = 4095, fb = 3277, go = 2048;      /* x/4096: 1.0 in, 0.8 feedback, 0.5 out */
+    for (int s = 0; s < 25; s++) STEP(s, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0);   /* nops: ACC = 0 */
+    STEP(1, 0,0,0, 0,0,0, 0,0, 0,1, 0,0, 1,0, 0);          /* read comb 1 */
+    STEP(3, 0,0,0, 0,0,0, 1,0, 0,1, 0,0, 1,0, 1);          /* MEMS0 = comb 1, read comb 2 */
+    STEP(5, 0,0,0, 0,0,0, 1,1, 0,1, 0,0, 1,0, 2);
+    STEP(7, 0,0,0, 0,0,0, 1,2, 0,1, 0,0, 1,0, 3);
+    STEP(9, 0,0,0, 0,0,0, 1,3, 0,0, 0,0, 1,0, 0);          /* MEMS3 = comb 4 */
+    STEP(10, 0,0,0, 1,1,0x20, 0,0, 0,0, 0,0, 1,0, 0); coef[10] = gi;   /* ACC = in * gi */
+    STEP(11, 0,1,0, 0,0,0, 0,0, 0,0, 0,0, 1,0, 0);         /* TEMP0 = in * gi */
+    for (int k = 0; k < 4; k++) {
+        STEP(12 + 2 * k, 0,0,0, 1,1,(unsigned)k, 0,0, 0,0, 0,0, 0,0, 0); coef[12 + 2 * k] = fb;  /* comb*fb + TEMP0 */
+        STEP(13 + 2 * k, 0,0,0, 0,0,0, 0,0, 1,0, 0,0, 1,0, (unsigned)(4 + k));                 /* write it */
+    }
+    STEP(20, 0,0,0, 1,1,0, 0,0, 0,0, 0,0, 1,0, 0); coef[20] = go;
+    STEP(21, 0,0,0, 1,1,2, 0,0, 0,0, 0,0, 0,1, 0); coef[21] = go;
+    STEP(22, 0,0,0, 1,1,1, 0,0, 0,0, 1,0, 1,0, 0); coef[22] = go;      /* EFREG0 = c1+c3 */
+    STEP(23, 0,0,0, 1,1,3, 0,0, 0,0, 0,0, 0,1, 0); coef[23] = go;
+    STEP(24, 0,0,0, 0,0,0, 0,0, 0,0, 1,1, 1,0, 0);                     /* EFREG1 = c2+c4 */
+#undef STEP
+    /* ring buffer: 8 K words, 2 KB aligned */
+    uint32_t raw = snd_mem_malloc(16384 + 2048);
+    if (!raw) { dbgio_write_str("[rev] no sound RAM for the ring buffer\n"); return; }
+    uint32_t rb = (raw + 2047u) & ~2047u;
+    spu_memset_sq(rb, 0x60006000u, 16384);      /* 0x6000 is the DSP's packed zero */
+    uint16_t madrs[8];
+    int w = 0;
+    for (int k = 0; k < 4; k++) { madrs[4 + k] = (uint16_t)w; madrs[k] = (uint16_t)(w + dly[k]); w += dly[k] + 1; }
+    for (int i = 0; i < 64; i++) g2_write_32(AICA_REG(0x3200 + i * 4), i < 8 ? madrs[i] : 0);
+    for (int i = 0; i < 128; i++) g2_write_32(AICA_REG(0x3000 + i * 4), (uint16_t)(coef[i] << 3));
+    for (int i = 0; i < 128; i++) for (int j = 0; j < 4; j++) g2_write_32(AICA_REG(0x3400 + i * 16 + j * 4), mpro[i][j]);
+    g2_write_32(AICA_REG(0x2804), (rb / 2048u) & 0xFFFu);                /* RBP, RBL = 0 (8 K words) */
+    g2_write_32(AICA_REG(0x2000 + 0 * 4), 0x1F);                         /* EFREG0: left, muted for now */
+    g2_write_32(AICA_REG(0x2000 + 1 * 4), 0x0F);                         /* EFREG1: right */
+    s_rev_up = 1;
+    { char b[80]; snprintf(b, sizeof b, "[rev] DSP up, ring at %08X, mpro[10] %04X\n", (unsigned)rb,
+                           (unsigned)(g2_read_32(AICA_REG(0x3400 + 10 * 16 + 4)) & 0xFFFF)); dbgio_write_str(b); }
+}
+/* level 0-15 (0 = off) for the reverb return */
+void dc_host_snd_reverb(unsigned level)
+{
+    if (s_snd_up <= 0) return;
+    if (!s_rev_up) rev_setup();
+    if (!s_rev_up) return;
+    if (level > 15) level = 15;
+    g2_write_32(AICA_REG(0x2000 + 0 * 4), (level << 8) | 0x1F);
+    g2_write_32(AICA_REG(0x2000 + 1 * 4), (level << 8) | 0x0F);
+}
+/* reverb send of one SPU voice's channel, 0-15 */
+void dc_host_snd_send(int ch, unsigned level)
+{
+    if (s_snd_up <= 0 || ch < 0 || ch >= 24) return;
+    if (level > 15) level = 15;
+    g2_write_32(AICA_REG((uint32_t)s_chn[ch] * 0x80u + 0x20u), level << 4);   /* IMXL, ISEL 0 */
+}
 
 /* ---- video ------------------------------------------------------------ */
 /* PS1 15-bit is BGR (R in the low bits); the framebuffer is RGB555. */
