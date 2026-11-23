@@ -480,9 +480,10 @@ static void blit(int x, int y, int w, int h);
    picture (the title menu over the logo). That made text screens 3x slower,
    so by default everything is left to the PowerVR (SHADOW_MAX 0); the title
    menu then loses its background. -DSHADOW_MAX=96 restores the old way.
-   DC_PVR_FEEDBACK renders every frame into s_rtt and starts a frame the
-   game did not clear from the previous picture: work in progress (in Flycast
-   the title menu still comes out without its logo). */
+   DC_PVR_FEEDBACK renders every frame into a render target and starts a
+   frame the game did not clear from the last picture of the same buffer:
+   work in progress. Its three 1 MB targets leave only 7 texture slots
+   (23 without), too few for the 3D scenes. */
 #ifdef DC_PVR_FEEDBACK
 #define PVR_FEEDBACK 1
 #else
@@ -491,7 +492,18 @@ static void blit(int x, int y, int w, int h);
 #ifndef SHADOW_MAX
 #define SHADOW_MAX 0
 #endif
-static int s_rtt_valid;             /* s_rtt holds the whole last frame */
+/* One render target per frame buffer the game draws in (double buffering
+   at 0,0 and 0,256): a frame the game does not clear continues the last one
+   drawn in the same buffer.
+   A frame is rendered into a free target and reads the background from
+   the slot's last one (a target is never read while it is rendered to);
+   at the end the two swap. */
+static pvr_ptr_t s_rtts[3];
+static int s_cur[2] = {0, 1}, s_scr = 2;
+static int s_rtt_valid[2];          /* the slot holds a whole frame */
+static uint32_t s_rtt_stamp[2];     /* VRAM's generation stamp at that frame */
+static int s_slot;
+static int buf_slot(int ox, int oy) { return ox >= 300 || oy >= 200; }
 /* Frames are drawn in software too only while they stay light: a frame
    after a heavy one is taken for heavy from the start. */
 static int s_shadow = 1;
@@ -554,9 +566,14 @@ static void scene_open_area_ex(int x0, int y0, int x1, int y1, int cleared)
 }
 static void scene_open_area(int x0, int y0, int x1, int y1) { scene_open_area_ex(x0, y0, x1, y1, 1); }
 static void rtt_quad(void);
+static void rtt_quad_of(pvr_ptr_t t);
 static void scene_open_ex(int ox, int oy, int cleared)
 {
     pvr_wait_ready();
+#if PVR_FEEDBACK
+    s_slot = buf_slot(ox, oy);
+    if (s_rtts[2]) s_rtt = s_rtts[s_scr];
+#endif
     s_rtt_scene = s_rtt && (s_rtt_want || PVR_FEEDBACK);
     if (s_rtt_scene) pvr_scene_begin_rtt(s_rtt, 640, 480, RTT_W);
     else pvr_scene_begin();
@@ -572,10 +589,14 @@ static void scene_open_ex(int ox, int oy, int cleared)
     s_sx = 640.0f / (float)(d.w > 0 ? d.w : 320);
     s_sy = 480.0f / (float)(d.h > 0 ? d.h : 240);
     int bw = d.w > 0 ? d.w : 320, bh = d.h > 0 ? d.h : 240;
-    int ok = !cleared && vram_true(ox, oy, bw, bh);
+    /* the slot's last frame when VRAM has not changed since (it also has what
+       the PowerVR drew), else VRAM when its copy is true */
+    int prev = !cleared && s_rtt_scene && s_rtt_valid[s_slot];
+    int same = prev && stamp_of(ox, bw, oy, bh) == s_rtt_stamp[s_slot];
+    int ok = !cleared && !same && vram_true(ox, oy, bw, bh);
     s_bg = cleared ? 0 : ok ? 2 : 1;
     if (ok) blit(ox, oy, d.w > 0 ? d.w : 320, d.h > 0 ? d.h : 240);
-    else if (!cleared && s_rtt_scene && s_rtt_valid) { rtt_quad(); s_bg = 4; }
+    else if (prev) { rtt_quad_of(s_rtts[s_cur[s_slot]]); s_bg = 4; }
 }
 
 static void send_header_ex(const DcPrim* p, pvr_ptr_t tex, uint32_t fmt, int tw, int th);
@@ -625,12 +646,14 @@ static void rtt_split(void)
 }
 
 /* s_rtt over the whole screen, texel for pixel. */
-static void rtt_quad(void)
+static void rtt_quad(void) { rtt_quad_of(s_rtt); }
+static void rtt_quad_of(pvr_ptr_t t)
 {
     DcPrim p;
     memset(&p, 0, sizeof p);
     p.tex = 1; p.raw = 1;
-    send_header_ex(&p, s_rtt, RTT_FMT, RTT_W, RTT_H);
+    s_hdr_key = ~0u;
+    send_header_ex(&p, t, RTT_FMT, RTT_W, RTT_H);
     const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
     pvr_vertex_t vx;
     for (int k = 0; k < 4; k++) {
@@ -710,7 +733,10 @@ static void scene_close(void)
 {
     if (!s_scene) return;
     if (s_sync) { s_sync--; s_rtt_idle = 0; }
-    s_rtt_valid = s_rtt_scene;          /* the whole frame went to s_rtt */
+    s_rtt_valid[s_slot] = s_rtt_scene && s_rtts[2];     /* the whole frame went to s_rtt */
+    if (s_rtt_valid[s_slot]) { DcGpuDisplay d_; dc_gpu_display(&d_);
+        s_rtt_stamp[s_slot] = stamp_of(s_ox, d_.w > 0 ? d_.w : 320, s_oy, d_.h > 0 ? d_.h : 240);
+        int t = s_cur[s_slot]; s_cur[s_slot] = s_scr; s_scr = t; }
     if (s_rtt_scene) rtt_split();       /* nothing read the frame after all */
     if (s_rtt_hit) s_rtt_idle = 0;
     else if (s_rtt_want && ++s_rtt_idle > 30) s_rtt_want = 0;
@@ -1085,7 +1111,10 @@ void dc_gpu_hw_fill(int x, int y, int w, int h, uint16_t c)
     if (!g_dc_pvr_on || s_soft_frames) return;
     if (!s_scene) {
         if (!frame_area(x, y, x + w - 1, y + h - 1)) return;
-        scene_open_area(x, y, x + w - 1, y + h - 1);
+        /* only a fill over the whole picture clears the frame */
+        DcGpuDisplay d; dc_gpu_display(&d);
+        int whole = !PVR_FEEDBACK || (w >= (d.w > 0 ? d.w : 320) && h >= (d.h > 0 ? d.h : 240) - 16);
+        scene_open_area_ex(x, y, x + w - 1, y + h - 1, whole);
     } else {
         /* a smaller fill (a window background...) inside the frame */
         DcGpuDisplay d; dc_gpu_display(&d);
@@ -1178,7 +1207,11 @@ int dc_gpu_pvr_init(void)
     PVR_SET(PVR_FB_CFG_2, (PVR_GET(PVR_FB_CFG_2) | 0x8000) & ~8u);
     /* keep 256 KB free for the PowerVR's own use */
     pvr_ptr_t reserve = pvr_mem_malloc(256 * 1024);
-    s_rtt = pvr_mem_malloc(RTT_W * RTT_H * 2);
+    s_rtt = s_rtts[0] = pvr_mem_malloc(RTT_W * RTT_H * 2);
+#if PVR_FEEDBACK
+    s_rtts[1] = pvr_mem_malloc(RTT_W * RTT_H * 2);
+    s_rtts[2] = pvr_mem_malloc(RTT_W * RTT_H * 2);
+#endif
     { char b[64]; snprintf(b, sizeof b, "[pvr] rtt at %08x\n", (unsigned)(uintptr_t)s_rtt); dbgio_write_str(b); }
     pvr_set_pal_format(PVR_PAL_ARGB1555);
     for (int i = 0; i < 256; i++) {
