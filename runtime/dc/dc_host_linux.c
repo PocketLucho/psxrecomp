@@ -225,3 +225,8 @@ void __stack_chk_fail(void)
     snprintf(b, sizeof b, "stack smashing in host code called from %p", __builtin_return_address(0));
     dc_fatal("%s", b);
 }
+
+void dc_host_audio_push(const int16_t* lr, unsigned frames, unsigned rate)
+{
+    (void)lr; (void)frames; (void)rate;      /* no audio output on the Linux host yet */
+}

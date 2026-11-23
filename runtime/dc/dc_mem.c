@@ -13,16 +13,17 @@ DcStats g_dc_stats;
 /* ---------------------------------------------------------------- I/O state */
 static uint32_t s_istat, s_imask;
 static uint32_t s_dma_madr[7], s_dma_bcr[7], s_dma_chcr[7], s_dpcr = 0x07654321u, s_dicr;
-static uint32_t s_tmr_mode[3], s_tmr_target[3], s_tmr_base[3];
+static uint32_t s_tmr_mode[3], s_tmr_target[3];
 static uint8_t  s_io_other[0x2000];    /* plain storage for registers we do not model */
 static uint32_t s_cache_ctrl;
 
-/* SPU: 512 KB sound RAM and the registers libspu polls. Voices are not mixed
- * yet; the AICA port will replace this. */
-static uint8_t  s_spu_ram[512 * 1024];
-static uint32_t s_spu_addr;              /* transfer address in bytes */
-static uint16_t s_spu_cnt;
-static uint16_t spu_stat(void) { return (uint16_t)(s_spu_cnt & 0x3Fu); }
+/* SPU: dc_spu.c */
+uint16_t dc_spu_read(uint32_t p);
+void dc_spu_write(uint32_t p, uint16_t v);
+void dc_spu_dma(uint8_t* ram, uint32_t madr, uint32_t words, int to_spu);
+void dc_spu_cd_push(const int16_t* lr, unsigned frames, unsigned rate);
+void dc_spu_tick(void);
+void dc_spu_reset(void);
 
 /* CD-ROM controller: enough to answer commands with a status byte. */
 static uint8_t  s_cd_index, s_cd_ie, s_cd_if, s_cd_stat = 0x02;
@@ -37,6 +38,7 @@ void dc_io_reset(void)
     s_dicr = 0;
     memset(s_io_other, 0, sizeof s_io_other);
     dc_gpu_reset();
+    dc_spu_reset();
 }
 
 uint32_t dc_io_istat(void) { return s_istat; }
@@ -60,16 +62,60 @@ static void log_io(const char* what, uint32_t a, uint32_t v)
 }
 
 /* ---------------------------------------------------------------- timers */
-static uint32_t tmr_now(int t)
+/* Counters run off host time. Each timer keeps a 64-bit tick origin; the
+ * guest sees (ticks - origin) wrapped at the target (reset-at-target mode) or
+ * at 0x10000. Target and overflow IRQs are raised from dc_io_poll: the sound
+ * driver ticks its sequencer from a root-counter IRQ. */
+static uint64_t s_tmr_org[3], s_tmr_next[3];
+static uint32_t s_tmr_period[3], s_tmr_armed;
+uint32_t g_dc_tmr_irqs[3];
+static uint64_t tmr_now(int t)
 {
     uint64_t us = dc_host_ticks_us();
-    switch (t) {
-    case 0: return (uint32_t)(us * 53u / 10u);       /* ~dot clock */
-    case 1: return (uint32_t)(us * 157u / 10000u);   /* hblank, ~15.7 kHz */
-    default: return (uint32_t)(us * 423u / 100u);    /* sysclk/8 */
+    uint32_t src = (s_tmr_mode[t] >> 8) & 3u;
+    if (t == 2 && (src & 2u)) return us * 4233600u / 1000000u;     /* sysclk/8 */
+    if (t == 1 && (src & 1u)) return us * 15734u / 1000000u;       /* hblank */
+    if (t == 0 && (src & 1u)) return us * 5320u / 1000u;           /* ~dot clock */
+    return us * 33868800u / 1000000u;                              /* sysclk */
+}
+static uint32_t tmr_count(int t)
+{
+    uint64_t d = tmr_now(t) - s_tmr_org[t];
+    uint32_t tg = s_tmr_target[t];
+    if ((s_tmr_mode[t] & 8u) && tg) return (uint32_t)(d % (tg + 1u));
+    return (uint32_t)d & 0xFFFFu;
+}
+static void tmr_arm(int t)
+{
+    uint32_t m = s_tmr_mode[t], tg = s_tmr_target[t], per = 0;
+    if ((m & 0x10u) && tg) per = (m & 8u) ? tg + 1u : 0x10000u;
+    else if (m & 0x20u) per = 0x10000u;
+    s_tmr_period[t] = per;
+    if (per) { s_tmr_armed |= 1u << t; s_tmr_next[t] = s_tmr_org[t] + ((m & 0x10u) && tg ? tg : per); }
+    else s_tmr_armed &= ~(1u << t);
+}
+static unsigned s_tmr_owed[3];
+static void tmr_poll(void)
+{
+    for (int t = 0; t < 3; t++) {
+        if (!(s_tmr_armed & (1u << t))) continue;
+        uint64_t now = tmr_now(t);
+        while (now >= s_tmr_next[t] && s_tmr_owed[t] < 8) {
+            s_tmr_owed[t]++;
+            if (!(s_tmr_mode[t] & 0x40u)) { s_tmr_armed &= ~(1u << t); break; }
+            s_tmr_next[t] += s_tmr_period[t];
+        }
+        if (now >= s_tmr_next[t]) s_tmr_next[t] = now + s_tmr_period[t];   /* long stall */
+    }
+    /* one tick per timer per poll, each once the last one was acknowledged */
+    for (int t = 0; t < 3; t++) {
+        uint32_t bit = 1u << (4 + t);
+        if (!s_tmr_owed[t] || (s_istat & bit)) continue;
+        s_tmr_owed[t]--; g_dc_tmr_irqs[t]++;
+        s_tmr_mode[t] |= ((s_tmr_mode[t] & 0x10u) ? 0x800u : 0x1000u);
+        dc_irq_raise(bit);
     }
 }
-static uint32_t tmr_count(int t) { return (tmr_now(t) - s_tmr_base[t]) & 0xFFFFu; }
 
 /* ---------------------------------------------------------------- DMA */
 static void dma_finish(int ch)
@@ -119,13 +165,7 @@ static void dma_start(int ch)
         }
     } else if (ch == 4) {                /* SPU: RAM <-> sound RAM */
         uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
-        uint32_t a = madr;
-        for (uint32_t i = 0; i < words; i++, a += 4) {
-            uint32_t o = s_spu_addr & 0x7FFFCu;
-            if (chcr & 1u) memcpy(s_spu_ram + o, g_dc_ram + (a & 0x1FFFFCu), 4);
-            else memcpy(g_dc_ram + (a & 0x1FFFFCu), s_spu_ram + o, 4);
-            s_spu_addr += 4;
-        }
+        dc_spu_dma(g_dc_ram, madr, words, (int)(chcr & 1u));
     } else if (ch == 2) {                /* GPU block transfer */
         uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
         uint32_t a = madr;
@@ -175,6 +215,44 @@ static uint32_t s_cd_fifo_len, s_cd_fifo_pos;
 
 static uint32_t bcd(uint8_t v) { return (uint32_t)((v >> 4) * 10 + (v & 15)); }
 
+/* ---- XA-ADPCM: streamed audio sectors, decoded to PCM for the host ----- */
+static uint8_t s_xa_file, s_xa_chan, s_cd_muted;
+static int32_t s_xa_hist[2][2];          /* per channel: last two samples */
+static int16_t s_xa_pcm[18 * 8 * 28 * 2];  /* one sector, stereo frames */
+static void xa_decode(const uint8_t* sec)
+{
+    static const int32_t k0[4] = {0, 60, 115, 98}, k1[4] = {0, 0, -52, -55};
+    const uint8_t coding = sec[19];
+    const int stereo = coding & 1, rate = (coding & 4) ? 18900 : 37800, eight = (coding & 0x10) != 0;
+    const uint8_t* d = sec + 24;
+    int16_t* o = s_xa_pcm;
+    unsigned frames = 0;
+    int16_t mono[28];
+    for (int g = 0; g < 18; g++, d += 128) {
+        const int units = eight ? 4 : 8;
+        for (int u = 0; u < units; u++) {
+            const uint8_t h = d[4 + u];
+            const int shift = h & 15, f = (h >> 4) & 3, ch = stereo ? (u & 1) : 0;
+            int32_t* hist = s_xa_hist[ch];
+            int16_t* dst = stereo ? o + (u >> 1) * 28 * 2 + ch : mono;
+            for (int j = 0; j < 28; j++) {
+                int32_t t;
+                if (eight) t = (int32_t)(int8_t)d[16 + j * 4 + u] << 8;
+                else t = (int32_t)(int16_t)((uint16_t)((d[16 + j * 4 + (u >> 1)] >> ((u & 1) * 4)) & 15) << 12);
+                t = (t >> (shift > 12 ? 9 : shift)) + ((hist[0] * k0[f] + hist[1] * k1[f] + 32) >> 6);
+                t = t < -32768 ? -32768 : t > 32767 ? 32767 : t;
+                hist[1] = hist[0]; hist[0] = t;
+                if (stereo) dst[j * 2] = (int16_t)t;
+                else dst[j] = (int16_t)t;
+            }
+            if (!stereo) { for (int j = 0; j < 28; j++) { o[0] = o[1] = mono[j]; o += 2; } frames += 28; }
+            else if (u & 1) frames += 28;
+        }
+        if (stereo) o += units / 2 * 28 * 2;
+    }
+    if (!s_cd_muted) dc_spu_cd_push(s_xa_pcm, frames, (unsigned)rate);
+}
+
 static void cd_next_sector(void)
 {
     if (dc_host_cd_read_sector(s_cd_lba, s_cd_sector) != 0) {
@@ -185,6 +263,13 @@ static void cd_next_sector(void)
         return;
     }
     s_cd_lba++;
+    /* With XA-ADPCM on, audio sectors (mode 2, submode audio) go to the
+       decoder, if they pass the file/channel filter, and raise nothing. */
+    if ((s_cd_mode & 0x40) && s_cd_sector[15] == 2 && (s_cd_sector[18] & 0x04)) {
+        if (!(s_cd_mode & 0x08) || (s_cd_sector[16] == s_xa_file && s_cd_sector[17] == s_xa_chan))
+            xa_decode(s_cd_sector);
+        return;
+    }
     s_cd_sector_ready = 1;
     s_cd_stat = 0x22;
     cd_respond(1, 1, &s_cd_stat);
@@ -215,12 +300,14 @@ void dc_cd_debug(char* b, unsigned n)
  * counting VBlanks (VSync(n) waits, frame timing) then keeps real time even
  * when a poll comes late, instead of losing every VBlank but one. */
 static unsigned s_vbl_owed;
-unsigned dc_io_vblanks_owed(void) { return s_vbl_owed; }
+unsigned dc_io_vblanks_owed(void) { return s_vbl_owed + ((s_imask >> 4) & 7u ? s_tmr_owed[0] + s_tmr_owed[1] + s_tmr_owed[2] : 0u); }
 void dc_io_poll(void)
 {
     s_vbl_owed += dc_host_take_vblanks();
     if (s_vbl_owed > 8) s_vbl_owed = 8;      /* after a long stall (loading) */
     if (s_vbl_owed && !(s_istat & 1u)) { s_vbl_owed--; dc_irq_raise(1u); dc_host_vblank(); }
+    tmr_poll();
+    dc_spu_tick();
     if (!s_cd_reading || s_cd_if != 0 || s_cd_npend) return;
     uint64_t now = dc_host_ticks_us();
     if (now < s_cd_next_us) return;
@@ -255,7 +342,12 @@ static void cd_command(uint8_t cmd)
     else
         snprintf(b, sizeof b, "[cd] cmd %02X (%d params)\n", cmd, s_cd_nparam);
     if (cmd != 0x01 && g_dc_stats.cd_cmds < 400) dc_host_log(b);
-    if (s_cd_reading && cmd != 0x01) { s_cd_reading = 0; s_cd_npend = 0; }
+    if (cmd == 0x0E || cmd == 0x0D) { static int nl; if (nl < 200) { nl++; snprintf(b, sizeof b, "[cd] %s %02X %02X\n", cmd == 0x0E ? "Setmode" : "Setfilter", s_cd_param[0], s_cd_param[1]); dc_host_log(b); } }
+    /* status, filter, mute and position queries leave a read (an XA stream)
+       running; other commands end it */
+    const int keeps = cmd == 0x01 || cmd == 0x0B || cmd == 0x0C || cmd == 0x0D || cmd == 0x10 || cmd == 0x11 ||
+                      cmd == 0x13 || cmd == 0x14;
+    if (s_cd_reading && !keeps) { s_cd_reading = 0; s_cd_npend = 0; }
     uint8_t st = s_cd_stat = s_cd_reading ? 0x22 : 0x02;
     switch (cmd) {
     case 0x02:                           /* Setloc mm:ss:ff (BCD) */
@@ -263,6 +355,17 @@ static void cd_command(uint8_t cmd)
             s_cd_lba = (bcd(s_cd_param[0]) * 60 + bcd(s_cd_param[1])) * 75 + bcd(s_cd_param[2]) - 150;
         cd_respond(3, 1, &st); break;
     case 0x0E: s_cd_mode = s_cd_param[0]; cd_respond(3, 1, &st); break;   /* Setmode */
+    case 0x0D: s_xa_file = s_cd_param[0]; s_xa_chan = s_cd_param[1]; cd_respond(3, 1, &st); break;  /* Setfilter */
+    case 0x0B: s_cd_muted = 1; cd_respond(3, 1, &st); break;   /* Mute */
+    case 0x0C: s_cd_muted = 0; cd_respond(3, 1, &st); break;   /* Demute */
+    case 0x10: cd_respond(3, 8, s_cd_sector + 12); break;      /* GetlocL: header and subheader */
+    case 0x11: {                         /* GetlocP: track 1, position of the last sector */
+        uint32_t l = s_cd_lba ? s_cd_lba - 1 : 0, a = l + 150;
+        #define BCD(v) (uint8_t)(((v) / 10) << 4 | ((v) % 10))
+        uint8_t r[8] = {1, 1, BCD(l / 4500), BCD(l / 75 % 60), BCD(l % 75), BCD(a / 4500), BCD(a / 75 % 60), BCD(a % 75)};
+        #undef BCD
+        cd_respond(3, 8, r); break;
+    }
     case 0x19: {                         /* Test */
         static const uint8_t ver[4] = {0x94, 0x09, 0x19, 0xC0};
         cd_respond(3, 4, ver); break;
@@ -326,7 +429,7 @@ uint32_t dc_io_read(uint32_t p, int size)
     if (p == 0x1F8010F4u) return s_dicr;
     if (p >= 0x1F801100u && p < 0x1F801130u) {
         int t = (int)((p - 0x1F801100u) >> 4);
-        switch (p & 0xC) { case 0: return tmr_count(t); case 4: return s_tmr_mode[t]; case 8: return s_tmr_target[t]; }
+        switch (p & 0xC) { case 0: return tmr_count(t); case 4: { uint32_t m = s_tmr_mode[t]; s_tmr_mode[t] &= ~0x1800u; return m; } case 8: return s_tmr_target[t]; }
         return 0;
     }
     if (p >= 0x1F801800u && p < 0x1F801804u) return cd_read(p & 3);
@@ -335,9 +438,11 @@ uint32_t dc_io_read(uint32_t p, int size)
     if (p == 0x1F801824u) return 0x80040000u;                        /* MDEC status: idle */
     if (p == 0x1F801044u) return 0x00000005u;                        /* JOY_STAT: TX ready */
     if (p == 0x1FFE0130u) return s_cache_ctrl;
-    if (p == 0x1F801DAAu) return s_spu_cnt;
-    if (p == 0x1F801DAEu) return spu_stat();
-    if (p == 0x1F801DA6u) return (s_spu_addr >> 3) & 0xFFFFu;
+    if (p >= 0x1F801C00u && p < 0x1F801E60u) {
+        uint32_t v = dc_spu_read(p & ~1u);
+        if (size == 4) v |= (uint32_t)dc_spu_read((p & ~1u) + 2u) << 16;
+        return v;
+    }
     if (p >= 0x1F801000u && p < 0x1F803000u) {
         uint32_t o = p - 0x1F801000u, v = 0;
         memcpy(&v, s_io_other + (o & 0x1FFCu), 4);
@@ -369,9 +474,10 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
     if (p >= 0x1F801100u && p < 0x1F801130u) {
         int t = (int)((p - 0x1F801100u) >> 4);
         switch (p & 0xC) {
-        case 0: s_tmr_base[t] = tmr_now(t) - (v & 0xFFFFu); break;
-        case 4: s_tmr_mode[t] = v; s_tmr_base[t] = tmr_now(t); break;
-        case 8: s_tmr_target[t] = v & 0xFFFFu; break;
+        case 0: s_tmr_org[t] = tmr_now(t) - (v & 0xFFFFu); tmr_arm(t); break;
+        case 4: { s_tmr_mode[t] = (v & 0x3FFu) | 0x400u; s_tmr_org[t] = tmr_now(t); tmr_arm(t);
+                  char b[64]; snprintf(b, sizeof b, "[tmr] %d mode=%04X tgt=%04X\n", t, (unsigned)v, (unsigned)s_tmr_target[t]); dc_host_log(b); break; }
+        case 8: s_tmr_target[t] = v & 0xFFFFu; tmr_arm(t); break;
         }
         return;
     }
@@ -379,10 +485,10 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
     if (p == 0x1F801810u) { dc_gpu_gp0(v); return; }
     if (p == 0x1F801814u) { dc_gpu_gp1(v); return; }
     if (p == 0x1FFE0130u) { s_cache_ctrl = v; return; }
-    if (p == 0x1F801DAAu) { s_spu_cnt = (uint16_t)v; return; }
-    if (p == 0x1F801DA6u) { s_spu_addr = (v & 0xFFFFu) << 3; return; }
-    if (p == 0x1F801DA8u) {              /* manual FIFO write */
-        uint16_t h = (uint16_t)v; memcpy(s_spu_ram + (s_spu_addr & 0x7FFFEu), &h, 2); s_spu_addr += 2;
+    if (p >= 0x1F801C00u && p < 0x1F801E00u) {
+        if (size == 1) return;
+        dc_spu_write(p & ~1u, (uint16_t)v);
+        if (size == 4) dc_spu_write((p & ~1u) + 2u, (uint16_t)(v >> 16));
         return;
     }
     if (p >= 0x1F801000u && p < 0x1F803000u) {

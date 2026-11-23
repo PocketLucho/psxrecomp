@@ -23,6 +23,7 @@
 #include <dc/cdrom.h>
 #include <dc/biosfont.h>
 #include <dc/sq.h>
+#include <dc/sound/stream.h>
 #include <arch/timer.h>
 #include <arch/cache.h>
 #include <stdio.h>
@@ -281,6 +282,61 @@ uint16_t dc_host_pad_buttons(int port)
     return m;
 }
 
+/* ---- CD audio (XA) through an AICA stream ------------------------------ */
+/* The CD emulation pushes decoded frames into a ring; the stream callback
+ * takes them at the XA rate (37.8 or 18.9 kHz). Everything runs on the guest
+ * thread: pushes come from sector reads, polls from VBlanks and pushes. */
+#define AUD_RING 32768                      /* stereo frames, ~0.9 s at 37.8 kHz */
+static int16_t s_aud[AUD_RING * 2];
+static unsigned s_aud_r, s_aud_w;           /* frame indices, free-running */
+static unsigned s_aud_rate;
+static snd_stream_hnd_t s_aud_hnd = SND_STREAM_INVALID;
+static int16_t s_aud_out[8192] __attribute__((aligned(32)));
+
+static void* aud_cb(snd_stream_hnd_t hnd, int req, int* recv)
+{
+    (void)hnd;
+    unsigned want = (unsigned)req / 4;        /* bytes -> stereo frames */
+    if (want > sizeof s_aud_out / 4) want = sizeof s_aud_out / 4;
+    unsigned have = s_aud_w - s_aud_r, n = have < want ? have : want;
+    for (unsigned i = 0; i < n; i++) {
+        unsigned k = (s_aud_r + i) % AUD_RING;
+        s_aud_out[i * 2] = s_aud[k * 2]; s_aud_out[i * 2 + 1] = s_aud[k * 2 + 1];
+    }
+    s_aud_r += n;
+    if (n < want) memset(s_aud_out + n * 2, 0, (want - n) * 4);
+    *recv = (int)(want * 4);
+    return s_aud_out;
+}
+
+static void audio_poll(void)
+{
+    if (s_aud_hnd != SND_STREAM_INVALID && s_aud_rate) snd_stream_poll(s_aud_hnd);
+}
+
+void dc_host_audio_push(const int16_t* lr, unsigned frames, unsigned rate)
+{
+    if (s_aud_hnd == SND_STREAM_INVALID) {
+        if (snd_stream_init() < 0) return;
+        s_aud_hnd = snd_stream_alloc(aud_cb, 16384);
+        if (s_aud_hnd == SND_STREAM_INVALID) return;
+        snd_stream_volume(s_aud_hnd, 240);
+    }
+    if (rate != s_aud_rate) {
+        if (s_aud_rate) snd_stream_stop(s_aud_hnd);
+        s_aud_r = s_aud_w = 0;
+        s_aud_rate = rate;
+        snd_stream_start(s_aud_hnd, rate, 1);
+    }
+    for (unsigned i = 0; i < frames; i++) {
+        if (s_aud_w - s_aud_r >= AUD_RING) s_aud_r++;     /* full: drop the oldest */
+        unsigned k = s_aud_w % AUD_RING;
+        s_aud[k * 2] = lr[i * 2]; s_aud[k * 2 + 1] = lr[i * 2 + 1];
+        s_aud_w++;
+    }
+    audio_poll();
+}
+
 /* ---- video ------------------------------------------------------------ */
 /* PS1 15-bit is BGR (R in the low bits); the framebuffer is RGB555. */
 static uint16_t s_bgr2rgb[32768];
@@ -312,6 +368,10 @@ static void perf_report(const DcGpuDisplay* d)
         char b[96];
         snprintf(b, sizeof b, "[perf] %u vblanks: guest saw %u, %u frames drawn\n", t - last_total, polls, flips);
         dbgio_write_str(b);
+        { extern uint32_t g_dc_spu_peak, g_dc_spu_keyons, g_dc_tmr_irqs[3], g_dc_spu_us, g_dc_spu_frames, g_dc_drv_us;
+          snprintf(b, sizeof b, "[snd] keyons %u peak %u tmr2 %u mix %u ms/%u fr drv %u ms\n", (unsigned)g_dc_spu_keyons, (unsigned)g_dc_spu_peak,
+                   (unsigned)g_dc_tmr_irqs[2], (unsigned)(g_dc_spu_us / 1000), (unsigned)g_dc_spu_frames, (unsigned)(g_dc_drv_us / 1000));
+          g_dc_spu_peak = 0; g_dc_spu_us = g_dc_spu_frames = g_dc_drv_us = 0; dbgio_write_str(b); }
         if (g_dc_pvr_on) {
             extern unsigned g_dc_pvr_stat[4];
             snprintf(b, sizeof b, "[pvr] prims %u, software %u, textures %u, scenes %u\n",
@@ -336,6 +396,7 @@ void dc_host_vblank(void)
     static unsigned n;
     DcGpuDisplay d; dc_gpu_display(&d);
     perf_report(&d);
+    audio_poll();
     if (g_dc_pvr_on) { dc_gpu_pvr_vblank(); return; }
     if (++n < 180) return;          /* leave the boot messages up for ~3 s */
     if (!d.enabled || d.depth24 || d.w <= 0 || d.h <= 0) return;

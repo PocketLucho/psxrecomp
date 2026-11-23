@@ -89,3 +89,5 @@ int  dc_host_cd_read_sector(uint32_t lba, uint8_t* out2352);
  * instruction fetch (cache flush on hardware). */
 int  dc_host_load_overlay(const char* file, void* dst, uint32_t max);
 void dc_host_code_written(void* p, uint32_t n);
+/* Interleaved stereo PCM from CD audio (XA), `frames` frames at `rate` Hz. */
+void dc_host_audio_push(const int16_t* lr, unsigned frames, unsigned rate);

@@ -146,10 +146,28 @@ static void pad_update(void)
     }
 }
 
+uint32_t g_dc_drv_us;
 void dc_bios_interrupt(CPUState* cpu)
 {
     uint32_t pending = dc_io_istat() & dc_io_imask();
-    if (pending & 1u) { g_dc_stats.vblanks++; pad_update(); }
+    /* Handlers run on the kernel's exception stack, as on the real BIOS: the
+     * interrupted code may sit on the 1 KB scratchpad stack, and a sound
+     * driver's timer callback overflowed it into the game's data there. The
+     * caller restores the interrupted registers, sp included. */
+    cpu->gpr[29] = 0x8000F000u;
+    if (pending & 1u) { g_dc_stats.vblanks++; pad_update(); ev_deliver(cpu, 0xF2000003u, 2u); }
+    /* Root counters 0-2: the kernel's own handlers deliver RCntCNTn/EvSpINT
+     * and acknowledge the IRQ (ChangeClearRCnt default). Sound drivers run
+     * their sequencer off this event. */
+    for (int t = 0; t < 3; t++) {
+        uint32_t bit = 1u << (4 + t);
+        if (!(pending & bit)) continue;
+        dc_io_ack(bit);
+        pending &= ~bit;
+        { extern uint32_t g_dc_drv_us; uint64_t t0 = dc_host_ticks_us();
+          ev_deliver(cpu, 0xF2000000u | (uint32_t)t, 2u);
+          g_dc_drv_us += (uint32_t)(dc_host_ticks_us() - t0); }
+    }
     for (int pr = 0; pr < 4; pr++) {
         for (uint32_t q = s_intrp[pr], guard = 0; q && guard < 16; q = rd(q), guard++) {
             uint32_t func2 = rd(q + 4), func1 = rd(q + 8);
