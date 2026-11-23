@@ -56,7 +56,7 @@ static struct {
     uint32_t cmd[16];
     int ncmd, need, polyline;
     /* CPU -> VRAM / VRAM -> CPU transfers */
-    int load_active, load_x, load_y, load_w, load_h, load_i, load_n;
+    int load_active, load_x, load_y, load_w, load_h, load_i, load_n, load_cx, load_cy;
     int store_active, store_x, store_y, store_w, store_h, store_i, store_n;
     uint32_t gpuread;
 } G;
@@ -501,7 +501,7 @@ static void execute(const uint32_t* w, int n)
     case 5:                                     /* CPU -> VRAM: data follows */
         G.load_x = w[1] & 0x3FF; G.load_y = (w[1] >> 16) & 0x1FF;
         G.load_w = ((w[2] - 1) & 0x3FF) + 1; G.load_h = (((w[2] >> 16) - 1) & 0x1FF) + 1;
-        G.load_i = 0; G.load_n = G.load_w * G.load_h; G.load_active = 1;
+        G.load_i = 0; G.load_n = G.load_w * G.load_h; G.load_active = 1; G.load_cx = G.load_cy = 0;
         vram_touch(G.load_x, G.load_y, G.load_w, G.load_h);
         return;
     case 6:                                     /* VRAM -> CPU: read through GPUREAD */
@@ -528,14 +528,40 @@ static void execute(const uint32_t* w, int n)
 
 static void load_pixel(uint16_t c)
 {
-    int x = G.load_x + G.load_i % G.load_w, y = G.load_y + G.load_i / G.load_w;
-    uint16_t* d = px(x, y);
+    /* a running column/row: a division per pixel was most of a movie's time */
+    uint16_t* d = px(G.load_x + G.load_cx, G.load_y + G.load_cy);
+    if (++G.load_cx >= G.load_w) { G.load_cx = 0; G.load_cy++; }
     if (!(G.check_mask && (*d & 0x8000))) *d = c | (G.set_mask ? 0x8000 : 0);
     if (++G.load_i >= G.load_n) {
         G.load_active = 0;
         vram_touch(G.load_x, G.load_y, G.load_w, G.load_h);
         dc_gpu_hw_blit(G.load_x, G.load_y, G.load_w, G.load_h, G.clip_x0, G.clip_y0, G.clip_x1, G.clip_y1);
     }
+}
+
+/* A GPU DMA of image data (a movie's frames): whole rows at once. Returns
+ * the number of words taken; the caller sends the rest through dc_gpu_gp0. */
+uint32_t dc_gpu_load_words(const uint8_t* src, uint32_t n)
+{
+    if (!G.load_active || G.check_mask || G.set_mask || (G.load_cx & 1) || (G.load_w & 1)) return 0;
+    uint32_t done = 0;
+    while (done < n && G.load_active) {
+        int run = G.load_w - G.load_cx, x = (G.load_x + G.load_cx) & 1023, y = (G.load_y + G.load_cy) & 511;
+        if (x + run > 1024) run = 1024 - x;
+        uint32_t words = (uint32_t)run / 2u;
+        if (words > n - done) words = n - done;
+        if (!words) break;
+        memcpy(&g_dc_vram[(y << 10) | x], src + done * 4u, words * 4u);
+        done += words; G.load_cx += (int)words * 2; G.load_i += (int)words * 2;
+        if (G.load_cx >= G.load_w) { G.load_cx = 0; G.load_cy++; }
+        if (G.load_i >= G.load_n) {
+            G.load_active = 0;
+            vram_touch(G.load_x, G.load_y, G.load_w, G.load_h);
+            dc_gpu_hw_blit(G.load_x, G.load_y, G.load_w, G.load_h, G.clip_x0, G.clip_y0, G.clip_x1, G.clip_y1);
+        }
+    }
+    g_dc_stats.gp0_words += done;
+    return done;
 }
 
 void dc_gpu_gp0(uint32_t w)

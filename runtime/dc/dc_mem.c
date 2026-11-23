@@ -21,6 +21,16 @@ static uint32_t s_cache_ctrl;
 uint16_t dc_spu_read(uint32_t p);
 void dc_spu_write(uint32_t p, uint16_t v);
 void dc_spu_dma(uint8_t* ram, uint32_t madr, uint32_t words, int to_spu);
+void dc_mdec_reset(void);
+uint32_t dc_mdec_read(uint32_t p);
+void dc_mdec_write(uint32_t p, uint32_t v);
+void dc_mdec_dma_in(const uint8_t* ram, uint32_t madr, uint32_t words);
+int dc_mdec_dma_out(uint8_t* ram, uint32_t madr, uint32_t words);
+static int s_dma1_wait;
+static uint64_t s_dma1_wait_t;
+static uint64_t s_dma1_due;
+static uint32_t s_cd_lba, s_cd_mode;
+static int s_cd_burst;
 void dc_spu_cd_push(const int16_t* lr, unsigned frames, unsigned rate);
 void dc_spu_tick(void);
 void dc_spu_reset(void);
@@ -39,6 +49,7 @@ void dc_io_reset(void)
     memset(s_io_other, 0, sizeof s_io_other);
     dc_gpu_reset();
     dc_spu_reset();
+    dc_mdec_reset(); s_dma1_wait = 0; s_dma1_due = 0;
 }
 
 uint32_t dc_io_istat(void) { return s_istat; }
@@ -132,11 +143,30 @@ static void dma_finish(int ch)
 }
 
 uint32_t dc_cd_fifo_read(uint8_t* dst, uint32_t n);
+uint32_t dc_gpu_load_words(const uint8_t* src, uint32_t n);
 
 static void dma_start(int ch)
 {
     uint32_t madr = s_dma_madr[ch] & 0x1FFFFCu, bcr = s_dma_bcr[ch], chcr = s_dma_chcr[ch];
-    if (ch == 6) {                       /* OTC: build a reverse linked list */
+    if (ch == 0 || ch == 1) {            /* MDEC in / out */
+        uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
+        if (!words) words = 0x10000u;
+        if (ch == 0) {
+            dc_mdec_dma_in(g_dc_ram, madr, words);
+            dma_finish(0);
+            if (s_dma1_wait) { s_dma1_wait = 0; dma_start(1); }
+            return;
+        }
+        if (!dc_mdec_dma_out(g_dc_ram, madr, words)) { if (!s_dma1_wait) s_dma1_wait_t = dc_host_ticks_us(); s_dma1_wait = 1; return; }
+        s_dma1_wait = 0;
+        /* The data is in place, but the channel finishes later, as the real
+         * MDEC's would: a movie player clears its "frame decoded" flag right
+         * after starting the first slice, and a whole frame finishing before
+         * that left the flag cleared and the player waiting forever. */
+        s_dma1_due = dc_host_ticks_us() + 20u + words / 64u;
+        g_irq_pending = 1;               /* poll until it is due */
+        return;
+    } else if (ch == 6) {                       /* OTC: build a reverse linked list */
         uint32_t n = bcr & 0xFFFFu; if (!n) n = 0x10000u;
         uint32_t a = madr;
         for (uint32_t i = 0; i < n; i++, a -= 4) {
@@ -170,7 +200,12 @@ static void dma_start(int ch)
         uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
         uint32_t a = madr;
         for (uint32_t i = 0; i < words; i++, a += 4) {
-            if (chcr & 1u) { uint32_t w; memcpy(&w, g_dc_ram + (a & 0x1FFFFCu), 4); dc_gpu_gp0(w); }
+            if (chcr & 1u) {
+                uint32_t pa = a & 0x1FFFFCu, left = words - i;
+                if (pa + left * 4u > 0x200000u) left = (0x200000u - pa) / 4u;
+                uint32_t k = dc_gpu_load_words(g_dc_ram + pa, left);
+                if (k) { i += k - 1u; a += (k - 1u) * 4u; continue; }
+                uint32_t w; memcpy(&w, g_dc_ram + pa, 4); dc_gpu_gp0(w); }
             else { uint32_t w = dc_gpu_read(); memcpy(g_dc_ram + (a & 0x1FFFFCu), &w, 4); }
         }
         g_dc_stats.dma_gpu++;
@@ -207,8 +242,8 @@ static void cd_respond(uint8_t irq, int n, const uint8_t* r)
 
 /* Sector reading: Setloc target, ReadN/ReadS stream one INT1 per sector,
  * paced by the game's acknowledgements. */
-static uint32_t s_cd_lba, s_cd_mode;
-static int s_cd_reading, s_cd_sector_ready;
+
+static int s_cd_reading, s_cd_sector_ready, s_cd_have;
 static uint8_t s_cd_sector[2352];
 static uint8_t s_cd_fifo[2352];
 static uint32_t s_cd_fifo_len, s_cd_fifo_pos;
@@ -270,14 +305,28 @@ static void cd_next_sector(void)
             xa_decode(s_cd_sector);
         return;
     }
-    s_cd_sector_ready = 1;
+    s_cd_sector_ready = 1; s_cd_have = 1;
     s_cd_stat = 0x22;
+    /* A movie frame (STR: a 0x0160/0x8001 header, sector n of m) is read in
+     * one burst once its first sector is in: the game starts decoding a
+     * frame as soon as it begins to arrive, counting on the PS1's slower CPU
+     * to never catch up with the drive. The schedule still advances one
+     * period per sector, so the stream keeps its real-time rate. */
+    {
+        const uint8_t* h = s_cd_sector + 24;
+        uint16_t sn = (uint16_t)(h[4] | h[5] << 8), sc = (uint16_t)(h[6] | h[7] << 8);
+        s_cd_burst = (s_cd_mode & 0x40) && h[0] == 0x60 && h[1] == 0x01 && h[2] == 0x01 && h[3] == 0x80 && sn + 1u < sc;
+    }
     cd_respond(1, 1, &s_cd_stat);
 }
 
+/* Poll at back-edges, not only at vblank, while a movie streams: its
+ * sectors are due every 6.7 ms and a frame's come in a burst. */
+int dc_io_cd_kick(void) { return s_dma1_due || (s_cd_reading && (s_cd_mode & 0x40) && s_cd_if == 0 && !s_cd_npend); }
 static void cd_ack(uint8_t bits)
 {
     s_cd_if &= ~bits;
+    if (dc_io_cd_kick()) g_irq_pending = 1;
     if (s_cd_if == 0 && s_cd_npend) {
         CdResp x = s_cd_pend[0];
         memmove(s_cd_pend, s_cd_pend + 1, sizeof(CdResp) * (size_t)--s_cd_npend);
@@ -308,17 +357,34 @@ void dc_io_poll(void)
     if (s_vbl_owed && !(s_istat & 1u)) { s_vbl_owed--; dc_irq_raise(1u); dc_host_vblank(); }
     tmr_poll();
     dc_spu_tick();
+    if (s_dma1_due && dc_host_ticks_us() >= s_dma1_due) { s_dma1_due = 0; dma_finish(1); }
     if (!s_cd_reading || s_cd_if != 0 || s_cd_npend) return;
+    /* A movie player drops any sector that arrives while the MDEC output
+     * DMA is busy (it checks the channel's busy bit in its sector handler),
+     * and then frees more of its ring than was written. The drive keeps the
+     * sector in its buffer until the slice is out. */
     uint64_t now = dc_host_ticks_us();
-    if (now < s_cd_next_us) return;
-    s_cd_next_us = now + ((s_cd_mode & 0x80) ? 6667u : 13333u);
+    if (s_dma1_due) return;
+    if (s_dma1_wait && now - s_dma1_wait_t < 50000u) return;
+    /* nor before the game has seen the last DMA's completion: a movie
+     * player marks a frame complete from the DMA3 interrupt, and a sector
+     * handled first is dropped (or the frame flag lands on the next one) */
+    if (s_istat & 8u) return;
+    uint32_t per = (s_cd_mode & 0x80) ? 6667u : 13333u;
+    /* Early (burst) delivery only once the game has read the last sector:
+     * its handler acknowledges the interrupt before it asks for the data. */
+    if (now < s_cd_next_us && !(s_cd_burst && !s_cd_sector_ready && s_cd_next_us - now < 16u * per)) return;
+    if (now > s_cd_next_us + 4u * per) s_cd_next_us = now;     /* after a stall: no catching up */
+    s_cd_next_us += per;
     cd_next_sector();
 }
 
 static void cd_load_fifo(void)
 {
     if (s_cd_trace > 0) { char b[48]; snprintf(b, sizeof b, "[cd] fifo load ready=%d\n", s_cd_sector_ready); dc_host_log(b); }
-    if (!s_cd_sector_ready) return;
+    /* The drive keeps the sector in its buffer: asking for the data again
+     * (a movie player's deferred sector handler does) reads it again. */
+    if (!s_cd_sector_ready && !(s_cd_have && s_cd_fifo_len == 0)) return;
     if (s_cd_mode & 0x20) { memcpy(s_cd_fifo, s_cd_sector + 12, 2340); s_cd_fifo_len = 2340; }
     else { memcpy(s_cd_fifo, s_cd_sector + 24, 2048); s_cd_fifo_len = 2048; }
     s_cd_fifo_pos = 0;
@@ -380,6 +446,7 @@ static void cd_command(uint8_t cmd)
         cd_respond(3, 1, &st);
         s_cd_reading = 1;
         s_cd_next_us = dc_host_ticks_us() + 20000u;   /* seek time */
+        s_cd_burst = 0; s_cd_have = 0;
         break;
     default:
         cd_respond(3, 1, &st);
@@ -435,7 +502,7 @@ uint32_t dc_io_read(uint32_t p, int size)
     if (p >= 0x1F801800u && p < 0x1F801804u) return cd_read(p & 3);
     if (p == 0x1F801810u) return dc_gpu_read();
     if (p == 0x1F801814u) return dc_gpu_stat();
-    if (p == 0x1F801824u) return 0x80040000u;                        /* MDEC status: idle */
+    if (p == 0x1F801820u || p == 0x1F801824u) return dc_mdec_read(p);
     if (p == 0x1F801044u) return 0x00000005u;                        /* JOY_STAT: TX ready */
     if (p == 0x1FFE0130u) return s_cache_ctrl;
     if (p >= 0x1F801C00u && p < 0x1F801E60u) {
@@ -462,7 +529,8 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
         switch (p & 0xC) {
         case 0: s_dma_madr[ch] = v & 0xFFFFFFu; break;
         case 4: s_dma_bcr[ch] = v; break;
-        case 8: s_dma_chcr[ch] = v; if (v & (1u << 24)) dma_start(ch); break;
+        case 8: s_dma_chcr[ch] = v;
+            if (v & (1u << 24)) dma_start(ch); break;
         }
         return;
     }
@@ -483,6 +551,11 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
     }
     if (p >= 0x1F801800u && p < 0x1F801804u) { cd_write(p & 3, (uint8_t)v); return; }
     if (p == 0x1F801810u) { dc_gpu_gp0(v); return; }
+    if (p == 0x1F801820u || p == 0x1F801824u) {
+        dc_mdec_write(p, v);
+        if (s_dma1_wait) { s_dma1_wait = 0; dma_start(1); }
+        return;
+    }
     if (p == 0x1F801814u) { dc_gpu_gp1(v); return; }
     if (p == 0x1FFE0130u) { s_cache_ctrl = v; return; }
     if (p >= 0x1F801C00u && p < 0x1F801E00u) {

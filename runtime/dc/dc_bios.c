@@ -86,9 +86,16 @@ static void guest_strcpy(uint32_t d, uint32_t s) { uint8_t c; do { c = dc_read8(
 
 static uint32_t guest_strlen(uint32_t s) { uint32_t n = 0; while (dc_read8(s + n)) n++; return n; }
 
+/* Guest TTY output goes to the serial port, which is slow: a game that
+ * prints every frame (libgpu's "VSync: timeout") would spend most of its
+ * time there, so only the first lines are kept. */
+static unsigned s_tty_budget = 4000;
+static void guest_putc(char ch) { if (s_tty_budget) { s_tty_budget--; char c[2] = {ch, 0}; dc_host_log(c); } }
 static void guest_puts(uint32_t s)
 {
     char b[256]; uint32_t i = 0;
+    if (s_tty_budget < 64) return;
+    s_tty_budget -= 64;
     while (i < sizeof b - 1 && (b[i] = (char)dc_read8(s + i))) i++;
     b[i] = 0;
     dc_host_log("[tty] "); dc_host_log(b); dc_host_log("\n");
@@ -204,7 +211,7 @@ static void bios_a0(CPUState* cpu, uint32_t fn)
     case 0x33: { uint32_t n = (A0 + 7u) & ~7u; if (s_heap_cur + n > s_heap_end) V0 = 0; else { V0 = s_heap_cur; s_heap_cur += n; } break; }
     case 0x34: break;                                   /* free: bump allocator */
     case 0x39: s_heap_cur = A0; s_heap_end = A0 + A1; break;
-    case 0x3C: { char c[2] = {(char)A0, 0}; dc_host_log(c); break; }
+    case 0x3C: guest_putc((char)A0); break;
     case 0x3E: guest_puts(A0); break;
     case 0x3F: guest_puts(A0); break;                   /* printf: format string only */
     case 0x44: break;                                   /* FlushCache */
@@ -248,7 +255,7 @@ static void bios_b0(CPUState* cpu, uint32_t fn)
     case 0x35:                                          /* write(fd, buf, len): tty only */
         if (A0 == 1) { char b[128]; uint32_t n = A2 < 127 ? A2 : 127; for (uint32_t i = 0; i < n; i++) b[i] = (char)dc_read8(A1 + i); b[n] = 0; dc_host_log(b); }
         V0 = A2; break;
-    case 0x3D: { char c[2] = {(char)A0, 0}; dc_host_log(c); break; }
+    case 0x3D: guest_putc((char)A0); break;
     case 0x3F: guest_puts(A0); break;
     case 0x4A: case 0x4B: case 0x4C: V0 = 1; break;     /* InitCARD/StartCARD/StopCARD */
     case 0x56: V0 = k_tab_addr[2]; break;               /* GetC0Table */

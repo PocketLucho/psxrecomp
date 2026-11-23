@@ -707,10 +707,61 @@ void dc_gpu_hw_flip(void)
     if (s_soft_frames) { s_soft_frames--; show_vram_display(); }
 }
 
+/* 24-bit display (movies): the MDEC's frames are copied into VRAM as packed
+   RGB888; convert the display area into a 512x256 RGB565 texture and show
+   it full screen, whenever that VRAM changed. */
+static pvr_ptr_t s_tex24;
+static uint32_t s_gen24 = ~0u;
+static void show_depth24(const DcGpuDisplay* d)
+{
+    int w = d->w > 512 ? 512 : d->w, h = d->h > 256 ? 256 : d->h;
+    if (w <= 0 || h <= 0) return;
+    uint32_t gen = (uint32_t)d->x * 7u + (uint32_t)d->y * 131u + (uint32_t)w;
+    int bx0 = (d->x & 1023) >> 6, bx1 = ((d->x + (w * 3 + 1) / 2 - 1) & 1023) >> 6;
+    for (int y = 0; y < h; y += 16) {
+        int by = ((d->y + y) & 511) >> 4;
+        for (int bx = bx0;; bx = (bx + 1) & 15) { gen = gen * 33u + g_dc_vram_gen[by][bx]; if (bx == bx1) break; }
+    }
+    if (gen == s_gen24) return;
+    if (!s_tex24) s_tex24 = pvr_mem_malloc(512 * 256 * 2);
+    if (!s_tex24) return;
+    s_gen24 = gen;
+    static uint16_t line[512] __attribute__((aligned(32)));
+    int bytes = (w * 2 + 31) & ~31;
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row = (const uint8_t*)&g_dc_vram[((d->y + y) & 511) << 10];
+        int o = (d->x & 1023) * 2;
+        for (int x = 0; x < w; x++, o += 3) {
+            if (o + 2 >= 2048) { line[x] = 0; continue; }
+            line[x] = (uint16_t)(((row[o] & 0xF8) << 8) | ((row[o + 1] & 0xFC) << 3) | (row[o + 2] >> 3));
+        }
+        sq_cpy((uint8_t*)s_tex24 + y * 1024, line, (size_t)bytes);
+    }
+    scene_open_ex(d->x, d->y, 1);
+    DcPrim p; memset(&p, 0, sizeof p);
+    p.n = 4; p.tex = 1; p.raw = 1; p.depth = 3;
+    send_header_ex(&p, s_tex24, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, 512, 256);
+    const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
+    pvr_vertex_t vx;
+    for (int k = 0; k < 4; k++) {
+        vx.flags = k == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        vx.x = (float)(cx[k] * 640); vx.y = (float)(cy[k] * 480); vx.z = 1.0f;
+        vx.u = (float)(cx[k] * w) * (1.0f / 512.0f);
+        vx.v = (float)(cy[k] * h) * (1.0f / 256.0f);
+        vx.argb = 0xFFFFFFFFu; vx.oargb = 0;
+        ta_put(&vx, sizeof vx);
+    }
+    s_prims = 0;
+    scene_close();
+}
+
 /* Called every VBlank: a game that draws without flipping still gets
    its picture shown. */
 void dc_gpu_pvr_vblank(void)
 {
+    { DcGpuDisplay d; dc_gpu_display(&d);
+      if (d.enabled && d.depth24) { if (!s_scene) show_depth24(&d); return; }
+      s_gen24 = ~0u; }
     static unsigned soft_vbl;
     /* only for games that do not flip: a slow frame of a flipping game is
        still being drawn */

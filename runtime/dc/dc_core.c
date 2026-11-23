@@ -71,11 +71,16 @@ void dc_fatal(const char* fmt, ...)
 
 /* ---- interrupts -------------------------------------------------------- */
 unsigned dc_io_vblanks_owed(void);
+int dc_io_cd_kick(void);
 static int s_in_irq;
 static int s_in_irq_dbg(void) { return s_in_irq; }
 
 static void deliver_irq(CPUState* cpu)
 {
+    /* Polling only for a streaming CD (2): check the host clock every 32nd
+     * back-edge; reading it and running the I/O tick each time cost more
+     * than the movie itself. */
+    { static unsigned skip; if (g_irq_pending == 2 && (++skip & 31u)) return; }
     g_irq_pending = 0;
     /* Nothing new is raised while the guest's handler runs. Under a slow host
      * the handler can take longer than one CD sector period of host time, and
@@ -84,8 +89,10 @@ static void deliver_irq(CPUState* cpu)
      * the host keeps counting them until the next poll. */
     if (s_in_irq) return;
     dc_io_poll();
-    if (!dc_bios_irq_enabled()) return;
-    if (!(dc_io_istat() & dc_io_imask())) return;
+    if (!dc_bios_irq_enabled() || !(dc_io_istat() & dc_io_imask())) {
+        if (dc_io_cd_kick()) g_irq_pending = 2;    /* keep polling a streaming CD */
+        return;
+    }
     g_dc_stats.irqs++;
     CPUState saved = *cpu;
     s_in_irq = 1;
@@ -97,6 +104,7 @@ static void deliver_irq(CPUState* cpu)
     *cpu = saved;
     cpu->cop0[12] = sr;
     if ((dc_io_istat() & dc_io_imask()) || dc_io_vblanks_owed()) g_irq_pending = 1;
+    else if (dc_io_cd_kick()) g_irq_pending = 2;
 }
 
 /* Called by generated code at back-edges when g_irq_pending is set. Services
