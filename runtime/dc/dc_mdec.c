@@ -11,10 +11,9 @@
 #include <string.h>
 #include <stdio.h>
 void dc_host_log(const char* s);
-/* The FTRV IDCT is about 1.6x faster per block, but a faster MDEC lets the
-   movie player run ahead of the CD ring at the end of the title movie
-   (a race in the CD/ring timing still to be fixed), so it is opt-in. */
-#if defined(_arch_dreamcast) && defined(DC_MDEC_FTRV)
+/* The IDCT runs on the SH4's vector unit (FTRV), about 1.6x faster per
+   block; DC_MDEC_NO_FTRV keeps the integer one. */
+#if defined(_arch_dreamcast) && !defined(DC_MDEC_NO_FTRV)
 #include <dc/matrix.h>
 #define MDEC_FTRV 1
 #endif
@@ -304,8 +303,22 @@ static void execute(void)
     finish();
 }
 
+#ifdef DC_LOG
+static uint32_t s_ml[24][4]; static unsigned s_mln; static int s_mdump;
+#endif
 static void begin(uint32_t v)
 {
+#ifdef DC_LOG
+    { uint64_t dc_host_ticks_us(void); uint32_t* e = s_ml[s_mln++ % 24]; e[0] = (uint32_t)(dc_host_ticks_us() / 100u); e[1] = v; e[2] = M.olen - M.opos; e[3] = M.end - M.pos;
+      uint32_t op = v >> 29;
+      if (!s_mdump && (op == 0 || op >= 4)) { s_mdump = 1; void dc_cd_dump_recent(void); char b[96];
+        for (unsigned i = 0; i < 24; i++) { uint32_t* f = s_ml[(s_mln + i) % 24]; if (!f[0]) continue;
+            snprintf(b, sizeof b, "[mcmd] t=%u.%ums %08X left_out=%u left_in=%u\n", (unsigned)(f[0] / 10), (unsigned)(f[0] % 10), (unsigned)f[1], (unsigned)f[2], (unsigned)f[3]); dc_host_log(b); }
+        dc_cd_dump_recent(); } }
+#endif
+#ifdef DC_LOG
+    if (!s_mdump) { void dc_ev(uint32_t, uint32_t, uint32_t); dc_ev('C', v, M.end - M.pos); }
+#endif
     M.cmd = v;
     M.b15 = (uint8_t)((v >> 25) & 1u); M.sgn = (uint8_t)((v >> 26) & 1u); M.depth = (uint8_t)((v >> 27) & 3u);
     M.blk = 4; M.cnt = 0; M.busy = 1;
@@ -344,6 +357,9 @@ static int out_ready(void)
     while (M.live && M.pos < M.end && M.din[M.pos] == 0xFE00u) M.pos++;
     return M.live && M.pos < M.end;
 }
+
+/* A frame is being decoded: output is left for DMA1 to take. */
+int dc_mdec_decoding(void) { return out_ready(); }
 
 static uint32_t get(void)
 {

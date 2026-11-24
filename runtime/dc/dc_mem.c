@@ -25,12 +25,21 @@ void dc_mdec_reset(void);
 uint32_t dc_mdec_read(uint32_t p);
 void dc_mdec_write(uint32_t p, uint32_t v);
 void dc_mdec_dma_in(const uint8_t* ram, uint32_t madr, uint32_t words);
+int dc_mdec_decoding(void);
+#ifdef DC_LOG
+void dc_ev(uint32_t type, uint32_t a, uint32_t b);
+#else
+#define dc_ev(t, a, b) ((void)0)
+#endif
 int dc_mdec_dma_out(uint8_t* ram, uint32_t madr, uint32_t words);
 static int s_dma1_wait;
 static uint64_t s_dma1_wait_t;
 static uint64_t s_dma1_due;
 static uint32_t s_cd_lba, s_cd_mode;
 static int s_cd_burst;
+static int s_cd_str;                /* the last sector delivered was a movie (STR) sector */
+static uint64_t s_cd_ready_t;        /* when it was delivered */
+static uint64_t s_dma1_done_t;       /* when the last MDEC output DMA finished */
 void dc_spu_cd_push(const int16_t* lr, unsigned frames, unsigned rate);
 void dc_spu_tick(void);
 void dc_spu_reset(void);
@@ -159,12 +168,13 @@ static void dma_start_(int ch)
         uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
         if (!words) words = 0x10000u;
         if (ch == 0) {
-            dc_mdec_dma_in(g_dc_ram, madr, words);
+            dc_ev('I', madr, words); dc_mdec_dma_in(g_dc_ram, madr, words);
             dma_finish(0);
             if (s_dma1_wait) { s_dma1_wait = 0; dma_start(1); }
             return;
         }
-        if (!dc_mdec_dma_out(g_dc_ram, madr, words)) { if (!s_dma1_wait) s_dma1_wait_t = dc_host_ticks_us(); s_dma1_wait = 1; return; }
+        dc_ev('O', madr, words);
+        if (!dc_mdec_dma_out(g_dc_ram, madr, words)) { dc_ev('W', madr, words); if (!s_dma1_wait) s_dma1_wait_t = dc_host_ticks_us(); s_dma1_wait = 1; return; }
         s_dma1_wait = 0;
         /* The data is in place, but the channel finishes later, as the real
          * MDEC's would: a movie player clears its "frame decoded" flag right
@@ -195,6 +205,7 @@ static void dma_start_(int ch)
     } else if (ch == 3) {                /* CD-ROM -> RAM */
         uint32_t words = (bcr & 0xFFFFu) * ((bcr >> 16) ? (bcr >> 16) : 1u);
         if (!words) words = 0x10000u;
+        dc_ev('T', madr, words);
         uint32_t a = madr;
         for (uint32_t i = 0; i < words; i++, a += 4) {
             uint8_t w[4]; dc_cd_fifo_read(w, 4);
@@ -295,9 +306,59 @@ static void xa_decode(const uint8_t* sec)
     if (!s_cd_muted) dc_spu_cd_push(s_xa_pcm, frames, (unsigned)rate);
 }
 
+#ifdef DC_LOG
+static uint32_t s_evl[400][4]; static unsigned s_evn;
+void dc_ev(uint32_t type, uint32_t a, uint32_t b)
+{ if (type == 'O' || type == 'D' || (type == 'Q' && a == 0x8004B6BCu)) return;
+  if (type == 'S' && s_evn && s_evl[(s_evn - 1) % 400][1] == 'S' && s_evn > 1 && s_evl[(s_evn - 2) % 400][1] == 'S') { s_evl[(s_evn - 1) % 400][3]++; return; }
+  uint32_t* e = s_evl[s_evn++ % 400]; e[0] = (uint32_t)(dc_host_ticks_us() / 10u); e[1] = type; e[2] = a; e[3] = b; }
+static void dc_ev_dump(void)
+{ char b[96]; for (unsigned i = 0; i < 400; i++) { uint32_t* e = s_evl[(s_evn + i) % 400]; if (!e[0]) continue;
+    snprintf(b, sizeof b, "[ev] %u.%02ums %c %08X %08X\n", (unsigned)(e[0] / 100), (unsigned)(e[0] % 100), (char)e[1], (unsigned)e[2], (unsigned)e[3]); dc_host_log(b); } }
+#endif
+#ifdef DC_LOG
+static uint32_t s_sl[32][5]; static unsigned s_sln;
+static uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, g_dc_ram + (a & 0x1FFFFCu), 4); return v; }
+void dc_cd_dump_recent(void)
+{
+    char b[160];
+    dc_ev_dump();
+    for (unsigned i = 0; i < 32; i++) { uint32_t* e = s_sl[(s_sln + i) & 31]; if (!e[0]) continue;
+        snprintf(b, sizeof b, "[sec] t=%u.%ums lba=%u sn=%u/%u frame=%u hdr=%08X\n", (unsigned)(e[0] / 10), (unsigned)(e[0] % 10), (unsigned)e[1], (unsigned)(e[2] & 0xFFFF), (unsigned)(e[2] >> 16), (unsigned)e[3], (unsigned)e[4]); dc_host_log(b); }
+    uint32_t tab = rd32(0x801E8A14u), n = rd32(0x801E8A18u);
+    snprintf(b, sizeof b, "[ring] tab=%08X n=%u w=%08X r=%08X now=%ums dma1due=%d wait=%d istat=%03X\n", (unsigned)tab, (unsigned)n, (unsigned)rd32(0x801E89F8u), (unsigned)rd32(0x801E8A00u),
+             (unsigned)(dc_host_ticks_us() / 1000u), s_dma1_due != 0, s_dma1_wait, (unsigned)s_istat); dc_host_log(b);
+    for (uint32_t i = 0; i < n && i < 32; i++) {
+        uint32_t a = tab + i * 32u;
+        snprintf(b, sizeof b, "[slot %u] %08X %08X %08X %08X %08X %08X %08X %08X\n", (unsigned)i, (unsigned)rd32(a), (unsigned)rd32(a + 4), (unsigned)rd32(a + 8), (unsigned)rd32(a + 12),
+                 (unsigned)rd32(a + 16), (unsigned)rd32(a + 20), (unsigned)rd32(a + 24), (unsigned)rd32(a + 28)); dc_host_log(b); }
+}
+#endif
+/* Xenogears' movie library (an overlay at 801D3000) keeps its sector ring
+ * here: a table of 32-byte slot headers (status in the low half of the first
+ * word, 0 = free), its slot count and the write index. */
+#define XG_STR_TAB  0x801E8A14u
+#define XG_STR_N    0x801E8A18u
+#define XG_STR_W    0x801E89F8u
+static int s_cd_hold;
+static uint32_t ram32(uint32_t a) { uint32_t v; memcpy(&v, g_dc_ram + (a & 0x1FFFFCu), 4); return v; }
+static int str_ring_room(const uint8_t* h)
+{
+    if (!(h[0] == 0x60 && h[1] == 0x01 && h[2] == 0x01 && h[3] == 0x80)) return 1;
+    uint32_t sn = (uint32_t)(h[4] | h[5] << 8), sc = (uint32_t)(h[6] | h[7] << 8);
+    if (sn != 0 || !sc) return 1;
+    uint32_t tab = ram32(XG_STR_TAB), n = ram32(XG_STR_N), w = ram32(XG_STR_W);
+    if ((tab >> 24) != 0x80u || n < 8u || n > 64u || w >= n || sc >= n) return 1;   /* not that player */
+    uint32_t at = (n - w - 1u >= sc) ? w : 0u;      /* the player wraps a frame that does not fit */
+    for (uint32_t i = 0; i < sc; i++)
+        if (ram32(tab + (at + i) * 32u) & 0xFFFFu) return 0;
+    return 1;
+}
+
 static void cd_next_sector(void)
 {
-    if (dc_host_cd_read_sector(s_cd_lba, s_cd_sector) != 0) {
+    static uint8_t xb[2352];
+    if (dc_host_cd_read_sector(s_cd_lba, xb) != 0) {
         static const uint8_t err[2] = {0x03, 0x80};
         s_cd_reading = 0;
         cd_respond(5, 2, err);
@@ -306,12 +367,23 @@ static void cd_next_sector(void)
     }
     s_cd_lba++;
     /* With XA-ADPCM on, audio sectors (mode 2, submode audio) go to the
-       decoder, if they pass the file/channel filter, and raise nothing. */
-    if ((s_cd_mode & 0x40) && s_cd_sector[15] == 2 && (s_cd_sector[18] & 0x04)) {
-        if (!(s_cd_mode & 0x08) || (s_cd_sector[16] == s_xa_file && s_cd_sector[17] == s_xa_chan))
-            xa_decode(s_cd_sector);
+       decoder, if they pass the file/channel filter, and raise nothing. They
+       are read aside: a data sector the game is still to read stays put. */
+    if ((s_cd_mode & 0x40) && xb[15] == 2 && (xb[18] & 0x04)) {
+        if (!(s_cd_mode & 0x08) || (xb[16] == s_xa_file && xb[17] == s_xa_chan))
+            xa_decode(xb);
         return;
     }
+    /* The first sector of a movie frame waits until the player's sector
+     * ring has room for the whole frame. On a PS1 the decoder keeps ahead of
+     * the drive; here it can fall behind, the ring fills, and the player's
+     * handling of a full ring (a frame start dropped where the ring wraps)
+     * leaves a stray frame header that its reader later takes for a frame,
+     * running off the end of the ring. The stream, with its interleaved XA
+     * audio, then waits for the player, as a slower drive would. */
+    if ((s_cd_mode & 0x40) && !str_ring_room(xb + 24)) { s_cd_lba--; if (!s_cd_hold) dc_ev('H', s_cd_lba, 0); s_cd_hold = 1; return; }
+    s_cd_hold = 0;
+    memcpy(s_cd_sector, xb, sizeof xb);
     s_cd_sector_ready = 1; s_cd_have = 1;
     s_cd_stat = 0x22;
     /* A movie frame (STR: a 0x0160/0x8001 header, sector n of m) is read in
@@ -322,8 +394,17 @@ static void cd_next_sector(void)
     {
         const uint8_t* h = s_cd_sector + 24;
         uint16_t sn = (uint16_t)(h[4] | h[5] << 8), sc = (uint16_t)(h[6] | h[7] << 8);
-        s_cd_burst = (s_cd_mode & 0x40) && h[0] == 0x60 && h[1] == 0x01 && h[2] == 0x01 && h[3] == 0x80 && sn + 1u < sc;
+        s_cd_str = (s_cd_mode & 0x40) && h[0] == 0x60 && h[1] == 0x01 && h[2] == 0x01 && h[3] == 0x80;
+        s_cd_burst = s_cd_str && sn + 1u < sc;
+        s_cd_ready_t = dc_host_ticks_us();
     }
+#ifdef DC_LOG
+    { const uint8_t* h = s_cd_sector + 24; uint32_t* e = s_sl[s_sln++ & 31];
+      e[0] = (uint32_t)(dc_host_ticks_us() / 100u); e[1] = s_cd_lba - 1u;
+      e[2] = (uint32_t)(h[4] | h[5] << 8) | (uint32_t)(h[6] | h[7] << 8) << 16;
+      e[3] = (uint32_t)(h[8] | h[9] << 8 | h[10] << 16 | (uint32_t)h[11] << 24); e[4] = (uint32_t)(h[0] | h[1] << 8 | h[2] << 16 | (uint32_t)h[3] << 24); }
+#endif
+    dc_ev('S', s_cd_lba - 1u, (uint32_t)(s_cd_sector[24 + 4] | s_cd_sector[24 + 8] << 8));
     cd_respond(1, 1, &s_cd_stat);
 }
 
@@ -365,7 +446,12 @@ void dc_io_poll(void)
     if (s_vbl_owed && !(s_istat & 1u)) { s_vbl_owed--; dc_irq_raise(1u); dc_host_vblank(); }
     tmr_poll();
     dc_spu_tick();
-    if (s_dma1_due && dc_host_ticks_us() >= s_dma1_due) { s_dma1_due = 0; dma_finish(1); }
+    if (s_dma1_due && dc_host_ticks_us() >= s_dma1_due) { s_dma1_due = 0; s_dma1_done_t = dc_host_ticks_us(); dc_ev('D', 1, 0); dma_finish(1); }
+#ifdef DC_LOG
+    if (s_cd_reading && (s_cd_mode & 0x40)) { uint32_t tab = rd32(0x801E8A14u), r = rd32(0x801E8A00u), w = rd32(0x801E89F8u);
+      if ((tab >> 24) == 0x80 && r < 64) { static uint32_t lr = ~0u, l26 = ~0u, lw = ~0u; uint32_t st = rd32(tab + r * 32u) & 0xFFFF, s26 = rd32(tab + 26 * 32u) & 0xFFFF;
+        if (r != lr || s26 != l26 || w != lw) { lr = r; l26 = s26; lw = w; dc_ev('Z', r << 16 | w, st << 16 | s26); } } }
+#endif
     if (!s_cd_reading || s_cd_if != 0 || s_cd_npend) return;
     /* A movie player drops any sector that arrives while the MDEC output
      * DMA is busy (it checks the channel's busy bit in its sector handler),
@@ -378,6 +464,12 @@ void dc_io_poll(void)
      * player marks a frame complete from the DMA3 interrupt, and a sector
      * handled first is dropped (or the frame flag lands on the next one) */
     if (s_istat & 8u) return;
+    /* nor while a movie sector put off because the MDEC was busy is still
+     * unread: the player reads it from its DMA1 callback, and a new sector in
+     * the drive's buffer would replace it, losing part of a frame (the title
+     * movie then never sees its last frame and waits forever). Sectors the
+     * game ignores outright are not waited for. */
+    if (s_cd_str && s_cd_sector_ready && s_dma1_done_t >= s_cd_ready_t && now - s_dma1_done_t < 3000u) return;
     uint32_t per = (s_cd_mode & 0x80) ? 6667u : 13333u;
     /* Early (burst) delivery only once the game has read the last sector:
      * its handler acknowledges the interrupt before it asks for the data. */
@@ -396,6 +488,7 @@ static void cd_load_fifo(void)
     if (s_cd_mode & 0x20) { memcpy(s_cd_fifo, s_cd_sector + 12, 2340); s_cd_fifo_len = 2340; }
     else { memcpy(s_cd_fifo, s_cd_sector + 24, 2048); s_cd_fifo_len = 2048; }
     s_cd_fifo_pos = 0;
+    dc_ev('F', s_cd_lba - 1u, s_cd_sector_ready);
     s_cd_sector_ready = 0;
 }
 
@@ -427,6 +520,9 @@ static void cd_command(uint8_t cmd)
     case 0x02:                           /* Setloc mm:ss:ff (BCD) */
         if (s_cd_nparam >= 3)
             s_cd_lba = (bcd(s_cd_param[0]) * 60 + bcd(s_cd_param[1])) * 75 + bcd(s_cd_param[2]) - 150;
+#ifdef DC_LOG
+        
+#endif
         cd_respond(3, 1, &st); break;
     case 0x0E: s_cd_mode = s_cd_param[0]; cd_respond(3, 1, &st); break;   /* Setmode */
     case 0x0D: s_xa_file = s_cd_param[0]; s_xa_chan = s_cd_param[1]; cd_respond(3, 1, &st); break;  /* Setfilter */
@@ -454,7 +550,7 @@ static void cd_command(uint8_t cmd)
         cd_respond(3, 1, &st);
         s_cd_reading = 1;
         s_cd_next_us = dc_host_ticks_us() + 20000u;   /* seek time */
-        s_cd_burst = 0; s_cd_have = 0;
+        s_cd_burst = 0; s_cd_have = 0; s_cd_str = 0;
         break;
     default:
         cd_respond(3, 1, &st);

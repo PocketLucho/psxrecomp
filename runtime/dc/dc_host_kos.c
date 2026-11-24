@@ -570,6 +570,8 @@ static void perf_report(const DcGpuDisplay* d)
         { void dc_cd_debug(char*, unsigned); void dc_mdec_debug(char*, unsigned); int dc_dma1_debug(void);
           char db[200]; dc_cd_debug(db, sizeof db); dbgio_write_str(db); dc_mdec_debug(db, sizeof db); dbgio_write_str(db);
           snprintf(db, sizeof db, "[dma1] %d\n", dc_dma1_debug()); dbgio_write_str(db); }
+        { static unsigned had, dumped; void dc_cd_dump_recent(void);
+          if (flips > 50) had = 1; else if (flips == 0 && had && !dumped) { dumped = 1; dc_cd_dump_recent(); } }
 #endif
         last_total = t; polls = flips = 0;
 #ifdef DC_PROFILE

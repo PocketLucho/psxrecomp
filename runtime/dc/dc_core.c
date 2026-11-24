@@ -91,6 +91,12 @@ static void deliver_irq(CPUState* cpu)
      * the host keeps counting them until the next poll. */
     if (s_in_irq) return;
     dc_io_poll();
+#ifdef DC_LOG
+    { void dc_ev(uint32_t, uint32_t, uint32_t); uint64_t dc_host_ticks_us(void); static uint64_t lx;
+      uint32_t pend = dc_io_istat() & dc_io_imask();
+      if (pend && !dc_bios_irq_enabled()) { uint64_t t = dc_host_ticks_us(); if (t - lx > 2000u) { lx = t; dc_ev('X', s_last_poll_pc, pend); } }
+      else if (pend & 4u) dc_ev('Q', s_last_poll_pc, pend); }
+#endif
     if (!dc_bios_irq_enabled() || !(dc_io_istat() & dc_io_imask())) {
         if (dc_io_cd_kick()) g_irq_pending = 2;    /* keep polling a streaming CD */
         return;
