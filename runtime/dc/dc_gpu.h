@@ -10,7 +10,7 @@ void     dc_gpu_gp1(uint32_t w);
 uint32_t dc_gpu_read(void);
 uint32_t dc_gpu_stat(void);
 
-typedef struct { int x, y, w, h, depth24, enabled; } DcGpuDisplay;
+typedef struct { int x, y, w, h, depth24, enabled, vis_h; } DcGpuDisplay;   /* vis_h: lines the display range shows */
 void dc_gpu_display(DcGpuDisplay* d);    /* current display area */
 
 /* Hooks for a hardware renderer (the PowerVR on Dreamcast). The defaults are

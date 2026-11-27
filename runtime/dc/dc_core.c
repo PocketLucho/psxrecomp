@@ -117,6 +117,21 @@ static void deliver_irq(CPUState* cpu)
     else if (dc_io_cd_kick()) g_irq_pending = 2;
 }
 
+/* Service interrupts until the movie frame the CD is delivering is complete
+ * (at most ~40 ms): for native code that stands in for a guest routine the
+ * PS1 would have run slowly enough for the sectors to arrive meanwhile. */
+int dc_cd_frame_arriving(void);
+void dc_wait_cd_frame(CPUState* cpu)
+{
+    if (s_in_irq) return;
+    uint64_t dc_host_ticks_us(void);
+    uint64_t t0 = dc_host_ticks_us();
+    while (dc_cd_frame_arriving() && dc_host_ticks_us() - t0 < 40000u) {
+        g_irq_pending = 1;
+        deliver_irq(cpu);
+    }
+}
+
 /* Called by generated code at back-edges when g_irq_pending is set. Services
  * the interrupt in place and returns 0, as the --target dc contract requires. */
 int dc_irq_slow(CPUState* cpu, uint32_t pc)

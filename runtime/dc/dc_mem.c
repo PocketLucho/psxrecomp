@@ -381,7 +381,12 @@ static void cd_next_sector(void)
      * leaves a stray frame header that its reader later takes for a frame,
      * running off the end of the ring. The stream, with its interleaved XA
      * audio, then waits for the player, as a slower drive would. */
-    if ((s_cd_mode & 0x40) && !str_ring_room(xb + 24)) { s_cd_lba--; if (!s_cd_hold) dc_ev('H', s_cd_lba, 0); s_cd_hold = 1; return; }
+    if ((s_cd_mode & 0x40) && !str_ring_room(xb + 24)) { s_cd_lba--; if (!s_cd_hold) { dc_ev('H', s_cd_lba, 0);
+#ifdef DC_LOG
+        { static int nh; if (nh++ < 4) { char b[200]; int o = snprintf(b, sizeof b, "[hold] w=%u st:", (unsigned)ram32(XG_STR_W)); uint32_t tab = ram32(XG_STR_TAB);
+          for (int i = 0; i < 32 && o < 190; i++) o += snprintf(b + o, sizeof b - o, "%X", (unsigned)(ram32(tab + i * 32u) & 0xF)); snprintf(b + o, sizeof b - o, "\n"); dc_host_log(b); } }
+#endif
+        } s_cd_hold = 1; return; }
     s_cd_hold = 0;
     memcpy(s_cd_sector, xb, sizeof xb);
     s_cd_sector_ready = 1; s_cd_have = 1;
@@ -410,6 +415,10 @@ static void cd_next_sector(void)
 
 /* Poll at back-edges, not only at vblank, while a movie streams: its
  * sectors are due every 6.7 ms and a frame's come in a burst. */
+/* A movie frame still arriving in a burst: the rest of its sectors are due
+ * now. A movie player whose decoding runs natively (much faster than on a
+ * PS1) calls this before decoding, so it never runs ahead of its sectors. */
+int dc_cd_frame_arriving(void) { return s_cd_reading && s_cd_str && s_cd_burst; }
 int dc_io_cd_kick(void) { return s_dma1_due || (s_cd_reading && (s_cd_mode & 0x40) && s_cd_if == 0 && !s_cd_npend); }
 static void cd_ack(uint8_t bits)
 {
@@ -520,6 +529,9 @@ static void cd_command(uint8_t cmd)
     case 0x02:                           /* Setloc mm:ss:ff (BCD) */
         if (s_cd_nparam >= 3)
             s_cd_lba = (bcd(s_cd_param[0]) * 60 + bcd(s_cd_param[1])) * 75 + bcd(s_cd_param[2]) - 150;
+#ifdef DC_LOG
+        { static uint32_t last; static int nd; if (s_cd_lba == last && (s_cd_mode & 0x40) && nd++ == 0) dc_cd_dump_recent(); last = s_cd_lba; }
+#endif
 #ifdef DC_LOG
         
 #endif

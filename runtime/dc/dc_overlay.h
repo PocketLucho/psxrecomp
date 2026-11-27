@@ -49,5 +49,9 @@ void dc_overlay_skip(const char* id, uint32_t addr);
  * skip can leave the game state the skipped function would have. */
 typedef void (*DcSkipFn)(CPUState* cpu);
 void dc_overlay_skip_fn(const char* id, uint32_t addr, DcSkipFn fn);
+/* Replace a guest function of one overlay with native code: fn does the
+ * whole job and sets v0 itself; the call returns to $ra. Up to 8 entries
+ * with the skips. */
+void dc_overlay_hle(const char* id, uint32_t addr, DcSkipFn fn);
 /* Parse "id@addr[,id@addr...]" (addr in hex), e.g. from an environment variable. */
 void dc_overlay_skip_parse(const char* spec);

@@ -805,6 +805,12 @@ static void show_depth24(const DcGpuDisplay* d)
 {
     int w = d->w > 512 ? 512 : d->w, h = d->h > 256 ? 256 : d->h;
     if (w <= 0 || h <= 0) return;
+    /* only the lines the display range shows, centred, black around them */
+    float y0 = 0.0f, y1 = 480.0f;
+    if (d->vis_h > 0 && d->vis_h < h) {
+        float sh = 480.0f * (float)d->vis_h / (float)d->h;
+        y0 = (480.0f - sh) * 0.5f; y1 = y0 + sh; h = d->vis_h;
+    }
     uint32_t gen = (uint32_t)d->x * 7u + (uint32_t)d->y * 131u + (uint32_t)w;
     int bx0 = (d->x & 1023) >> 6, bx1 = ((d->x + (w * 3 + 1) / 2 - 1) & 1023) >> 6;
     for (int y = 0; y < h; y += 16) {
@@ -834,7 +840,7 @@ static void show_depth24(const DcGpuDisplay* d)
     pvr_vertex_t vx;
     for (int k = 0; k < 4; k++) {
         vx.flags = k == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-        vx.x = (float)(cx[k] * 640); vx.y = (float)(cy[k] * 480); vx.z = 1.0f;
+        vx.x = (float)(cx[k] * 640); vx.y = cy[k] ? y1 : y0; vx.z = 1.0f;
         vx.u = (float)(cx[k] * w) * (1.0f / 512.0f);
         vx.v = (float)(cy[k] * h) * (1.0f / 256.0f);
         vx.argb = 0xFFFFFFFFu; vx.oargb = 0;

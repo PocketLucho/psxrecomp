@@ -42,8 +42,9 @@ static int (*load(const DcOverlay* o))(CPUState*, uint32_t)
 }
 static const DcOverlay* s_logged[8]; /* overlays already reported as resident */
 
-static struct { char id[48]; uint32_t addr; DcSkipFn fn; } s_skip[8];
+static struct { char id[48]; uint32_t addr; DcSkipFn fn; int hle; } s_skip[8];
 static int s_nskip;
+int g_dc_hle_off;   /* run the guest code of HLE'd functions (to check them) */
 
 void dc_overlay_skip_fn(const char* id, uint32_t addr, DcSkipFn fn)
 {
@@ -54,6 +55,12 @@ void dc_overlay_skip_fn(const char* id, uint32_t addr, DcSkipFn fn)
 }
 
 void dc_overlay_skip(const char* id, uint32_t addr) { dc_overlay_skip_fn(id, addr, 0); }
+void dc_overlay_hle(const char* id, uint32_t addr, DcSkipFn fn)
+{
+    if (s_nskip >= 8) return;
+    dc_overlay_skip_fn(id, addr, fn);
+    s_skip[s_nskip - 1].hle = 1;
+}
 
 void dc_overlay_skip_parse(const char* spec)
 {
@@ -75,6 +82,8 @@ static int skipped(CPUState* cpu, const DcOverlay* o, uint32_t addr)
 {
     for (int i = 0; i < s_nskip; i++) {
         if (s_skip[i].addr != dc_phys(addr) || strcmp(s_skip[i].id, o->id)) continue;
+        if (s_skip[i].hle && g_dc_hle_off) continue;
+        if (s_skip[i].hle) { s_skip[i].fn(cpu); cpu->pc = cpu->gpr[31]; return 1; }
         char b[96]; snprintf(b, sizeof b, "[overlay] skipped %s at %08X\n", o->id, (unsigned)addr);
         dc_host_log(b);
         if (s_skip[i].fn) s_skip[i].fn(cpu);

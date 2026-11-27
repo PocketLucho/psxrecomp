@@ -318,6 +318,7 @@ static void begin(uint32_t v)
 #endif
 #ifdef DC_LOG
     if (!s_mdump) { void dc_ev(uint32_t, uint32_t, uint32_t); dc_ev('C', v, M.end - M.pos); }
+    { static int nc; if (nc < 40 && (v >> 29) == 1) { nc++; char b[64]; snprintf(b, sizeof b, "[mcmd0] %08X\n", (unsigned)v); dc_host_log(b); } }
 #endif
     M.cmd = v;
     M.b15 = (uint8_t)((v >> 25) & 1u); M.sgn = (uint8_t)((v >> 26) & 1u); M.depth = (uint8_t)((v >> 27) & 3u);

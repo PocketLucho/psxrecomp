@@ -50,7 +50,7 @@ static struct {
     int set_mask, check_mask;
     /* GP1 state */
     int display_off;
-    uint32_t disp_x, disp_y, disp_mode;
+    uint32_t disp_x, disp_y, disp_mode, disp_y1, disp_y2;
     uint32_t dma_dir;
     /* command assembly */
     uint32_t cmd[16];
@@ -636,6 +636,7 @@ void dc_gpu_gp1(uint32_t w)
     case 0x03: G.display_off = w & 1; break;
     case 0x04: G.dma_dir = w & 3; break;
     case 0x05: G.disp_x = w & 0x3FE; G.disp_y = (w >> 10) & 0x1FF; dc_gpu_hw_flip(); break;
+    case 0x07: G.disp_y1 = w & 0x3FF; G.disp_y2 = (w >> 10) & 0x3FF; break;
     case 0x08: G.disp_mode = w & 0xFF; break;
     case 0x10:
         switch (w & 7) {
@@ -679,6 +680,11 @@ void dc_gpu_display(DcGpuDisplay* d)
     d->h = ((G.disp_mode & 0x24) == 0x24) ? 480 : 240;
     d->depth24 = (G.disp_mode >> 4) & 1;
     d->enabled = !G.display_off;
+    /* GP1(07): the scanlines that show picture; the rest of the screen is
+       black on a TV (a movie shows 224 of 240 lines). */
+    int vh = (int)G.disp_y2 - (int)G.disp_y1;
+    if (d->h == 480) vh *= 2;
+    d->vis_h = (G.disp_y2 > G.disp_y1 && vh < d->h) ? vh : d->h;
 }
 
 void dc_gpu_reset(void) { dc_gpu_gp1(0); }
