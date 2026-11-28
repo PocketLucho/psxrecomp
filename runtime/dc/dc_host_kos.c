@@ -684,3 +684,113 @@ int main(int argc, char** argv)
     thd_join(t, &rv);
     return (int)(intptr_t)rv;
 }
+
+/* ---- memory card on the VMU ------------------------------------------- */
+/* Each PS1 card file is one VMU file named "XG" + a hash of its name, with
+ * a VMS header (title, icon taken from the PS1 save's own icon) and as
+ * payload the 20-byte PS1 name followed by the file's blocks. The first
+ * memory card found on the maple bus is used. */
+#include <dc/vmu_pkg.h>
+#include <dc/vmufs.h>
+#include <kos/fs.h>
+
+static int vmu_dir(char* out, size_t n)
+{
+    maple_device_t* dev = maple_enum_type(0, MAPLE_FUNC_MEMCARD);
+    if (!dev) return -1;
+    snprintf(out, n, "/vmu/%c%d", 'a' + dev->port, dev->unit);
+    return 0;
+}
+
+static void vmu_name(const char* psx, char* out, size_t n)
+{
+    uint32_t h = 2166136261u;
+    for (const char* p = psx; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    snprintf(out, n, "XG%08lX", (unsigned long)h);
+}
+
+int dc_host_card_load(void (*add)(const char* name, const uint8_t* data, uint32_t size))
+{
+    char dir[16], path[48];
+    if (vmu_dir(dir, sizeof dir)) return -1;
+    file_t d = fs_open(dir, O_RDONLY | O_DIR);
+    if (d < 0) return -1;
+    char names[24][16]; int cnt = 0;
+    const dirent_t* e;
+    while ((e = fs_readdir(d)) && cnt < 24)
+        if (!strncmp(e->name, "XG", 2) && strlen(e->name) < 16) strcpy(names[cnt++], e->name);
+    fs_close(d);
+    for (int i = 0; i < cnt; i++) {
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        file_t f = fs_open(path, O_RDONLY);
+        if (f < 0) continue;
+        size_t sz = fs_total(f);
+        uint8_t* buf = (uint8_t*)malloc(sz);
+        vmu_pkg_t pkg;
+        if (buf && fs_read(f, buf, sz) == (ssize_t)sz && !vmu_pkg_parse(buf, sz, &pkg) && pkg.data_len > 20) {
+            char nm[21]; memcpy(nm, pkg.data, 20); nm[20] = 0;
+            add(nm, pkg.data + 20, (uint32_t)pkg.data_len - 20u);
+        }
+        free(buf);
+        fs_close(f);
+    }
+    return cnt;
+}
+
+int dc_host_card_save(const char* name, const uint8_t* data, uint32_t size)
+{
+    char dir[16], vn[16], path[48];
+    if (vmu_dir(dir, sizeof dir)) return -1;
+    vmu_name(name, vn, sizeof vn);
+    snprintf(path, sizeof path, "%s/%s", dir, vn);
+    uint8_t* pay = (uint8_t*)malloc(size + 20u);
+    if (!pay) return -1;
+    memset(pay, 0, 20); strncpy((char*)pay, name, 20);
+    memcpy(pay + 20, data, size);
+    static uint8_t icon[512];
+    vmu_pkg_t pkg;
+    memset(&pkg, 0, sizeof pkg);
+    strcpy(pkg.desc_short, "XENOGEARS");
+    strncpy(pkg.desc_long, name, sizeof pkg.desc_long - 1);
+    strcpy(pkg.app_id, "XENOGEARS-DC");
+    pkg.icon_cnt = 1; pkg.icon_anim_speed = 0; pkg.eyecatch_type = VMUPKG_EC_NONE;
+    pkg.icon_data = icon;
+    /* PS1 save header: 16-colour palette (BGR555) at 0x60, 16x16 4bpp icon at
+       0x80, low nibble first. VMU icon: 32x32 4bpp, high nibble first, ARGB4444. */
+    if (size >= 0x100 && data[0] == 'S' && data[1] == 'C') {
+        for (int i = 0; i < 16; i++) {
+            uint16_t c = (uint16_t)(data[0x60 + 2 * i] | data[0x61 + 2 * i] << 8);
+            unsigned r = (c & 31) >> 1, g = ((c >> 5) & 31) >> 1, b = ((c >> 10) & 31) >> 1;
+            pkg.icon_pal[i] = (uint16_t)((i || c ? 0xF000 : 0) | r << 8 | g << 4 | b);
+        }
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x += 2) {
+            uint8_t s = data[0x80 + (y / 2) * 8 + (x / 2) / 2];
+            unsigned p = (x / 2) & 1 ? s >> 4 : s & 15;
+            icon[y * 16 + x / 2] = (uint8_t)(p << 4 | p);
+        }
+    } else {
+        pkg.icon_pal[0] = 0xF000; pkg.icon_pal[1] = 0xF8CF;
+        for (int i = 0; i < 512; i++) icon[i] = (uint8_t)(((i / 16) / 4 + (i % 16) / 2) & 1 ? 0x11 : 0x00);
+    }
+    pkg.data_len = (int)size + 20;
+    pkg.data = pay;
+    uint8_t* out; int outsz;
+    int r = -1;
+    if (!vmu_pkg_build(&pkg, &out, &outsz)) {
+        fs_unlink(path);
+        file_t f = fs_open(path, O_WRONLY);
+        if (f >= 0) { r = fs_write(f, out, outsz) == outsz ? 0 : -1; fs_close(f); }
+        free(out);
+    }
+    free(pay);
+    return r;
+}
+
+int dc_host_card_erase(const char* name)
+{
+    char dir[16], vn[16], path[48];
+    if (vmu_dir(dir, sizeof dir)) return -1;
+    vmu_name(name, vn, sizeof vn);
+    snprintf(path, sizeof path, "%s/%s", dir, vn);
+    return fs_unlink(path);
+}

@@ -1098,13 +1098,21 @@ static void emit_prim(const DcPrim* p, int rtt, int atx, int aty, const Xf* xf)
     s_filter = 0;
 #ifndef DC_PVR_NO_FILTER
     if (p->tex && !rtt) {
-        /* texel for pixel: an upright quad as wide and tall as its texels */
+        /* texel for pixel: an upright rectangle (corners in any order,
+           mirrored or not) about as wide and tall as its texels; portraits
+           and other 2D art are often drawn with texels w-1 apart */
         int flat = p->n == 4;
         if (flat) {
-            const DcPrimVtx* v = p->v;
-            int dx = v[1].x - v[0].x, dy = v[2].y - v[0].y, du = v[1].u - v[0].u, dv = v[2].v - v[0].v;
-            flat = v[1].y == v[0].y && v[2].x == v[0].x && v[3].x == v[1].x && v[3].y == v[2].y &&
-                   (dx == du || dx == -du) && (dy == dv || dy == -dv);
+            int x0 = p->v[0].x, x1 = x0, y0 = p->v[0].y, y1 = y0, u0 = p->v[0].u, u1 = u0, v0 = p->v[0].v, v1 = v0;
+            for (int k = 1; k < 4; k++) {
+                const DcPrimVtx* v = &p->v[k];
+                x0 = v->x < x0 ? v->x : x0; x1 = v->x > x1 ? v->x : x1; y0 = v->y < y0 ? v->y : y0; y1 = v->y > y1 ? v->y : y1;
+                u0 = v->u < u0 ? v->u : u0; u1 = v->u > u1 ? v->u : u1; v0 = v->v < v0 ? v->v : v0; v1 = v->v > v1 ? v->v : v1;
+            }
+            for (int k = 0; k < 4 && flat; k++)
+                flat = (p->v[k].x == x0 || p->v[k].x == x1) && (p->v[k].y == y0 || p->v[k].y == y1);
+            int dw = (x1 - x0) - (u1 - u0), dh = (y1 - y0) - (v1 - v0);
+            flat = flat && dw >= -1 && dw <= 1 && dh >= -1 && dh <= 1;
         }
         s_filter = !flat;
     }

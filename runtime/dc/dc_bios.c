@@ -74,7 +74,8 @@ static void trace(char tbl, uint32_t fn, CPUState* cpu)
     static int n;
     if (tbl == 'B' && (fn == 0x35 || fn == 0x3D)) return;   /* tty output */
     if (tbl == 'B' && fn == 0x17) return;               /* ReturnFromException */
-    if (n++ < 400) {
+    int card = (tbl == 'B' && ((fn >= 0x32 && fn <= 0x36) || (fn >= 0x40 && fn <= 0x55) || fn == 0x5C || fn == 0x5D)) || (tbl == 'A' && fn >= 0x9C && fn <= 0xAF);
+    if (n++ < 400 || card) {
         char b[96];
         snprintf(b, sizeof b, "[bios] %c0:%02X a0=%08X a1=%08X ra=%08X\n", tbl, (unsigned)fn,
                  (unsigned)A0, (unsigned)A1, (unsigned)cpu->gpr[31]);
@@ -196,8 +197,13 @@ void dc_bios_interrupt(CPUState* cpu)
 }
 
 /* ---- A0 ---- */
+int dc_card_a0(CPUState* cpu, uint32_t fn);
+int dc_card_b0(CPUState* cpu, uint32_t fn);
+void dc_bios_event(CPUState* cpu, uint32_t cls, uint32_t spec) { ev_deliver(cpu, cls, spec); }
+
 static void bios_a0(CPUState* cpu, uint32_t fn)
 {
+    if (dc_card_a0(cpu, fn)) return;
     switch (fn) {
     case 0x13: do_setjmp(cpu, A0); V0 = 0; break;
     case 0x14: do_longjmp(cpu, A0); V0 = A1 ? A1 : 1; break;
@@ -224,6 +230,7 @@ static void bios_a0(CPUState* cpu, uint32_t fn)
 /* ---- B0 ---- */
 static void bios_b0(CPUState* cpu, uint32_t fn)
 {
+    if (dc_card_b0(cpu, fn)) return;
     switch (fn) {
     case 0x07: ev_deliver(cpu, A0, A1); break;
     case 0x08: V0 = ev_open(A0, A1, A2, A3); break;
@@ -257,7 +264,6 @@ static void bios_b0(CPUState* cpu, uint32_t fn)
         V0 = A2; break;
     case 0x3D: guest_putc((char)A0); break;
     case 0x3F: guest_puts(A0); break;
-    case 0x4A: case 0x4B: case 0x4C: V0 = 1; break;     /* InitCARD/StartCARD/StopCARD */
     case 0x56: V0 = k_tab_addr[2]; break;               /* GetC0Table */
     case 0x57: V0 = k_tab_addr[1]; break;               /* GetB0Table */
     case 0x5B: break;                                   /* ChangeClearPad */
