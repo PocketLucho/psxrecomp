@@ -22,6 +22,7 @@ uint16_t dc_spu_read(uint32_t p);
 void dc_spu_write(uint32_t p, uint16_t v);
 void dc_spu_dma(uint8_t* ram, uint32_t madr, uint32_t words, int to_spu);
 void dc_mdec_reset(void);
+__attribute__((weak)) void dc_game_vblank(void) {}
 uint32_t dc_mdec_read(uint32_t p);
 void dc_mdec_write(uint32_t p, uint32_t v);
 void dc_mdec_dma_in(const uint8_t* ram, uint32_t madr, uint32_t words);
@@ -452,7 +453,7 @@ void dc_io_poll(void)
 {
     s_vbl_owed += dc_host_take_vblanks();
     if (s_vbl_owed > 8) s_vbl_owed = 8;      /* after a long stall (loading) */
-    if (s_vbl_owed && !(s_istat & 1u)) { s_vbl_owed--; dc_irq_raise(1u); dc_host_vblank(); }
+    if (s_vbl_owed && !(s_istat & 1u)) { s_vbl_owed--; dc_irq_raise(1u); dc_host_vblank(); dc_game_vblank(); }
     tmr_poll();
     dc_spu_tick();
     if (s_dma1_due && dc_host_ticks_us() >= s_dma1_due) { s_dma1_due = 0; s_dma1_done_t = dc_host_ticks_us(); dc_ev('D', 1, 0); dma_finish(1); }
