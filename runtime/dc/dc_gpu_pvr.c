@@ -53,8 +53,16 @@ static int s_ox, s_oy;              /* VRAM origin of the frame being built */
 static float s_sx = 2.0f, s_sy = 2.0f;
 static uint32_t s_frame;
 static int s_trace_on;
+#if defined(DC_PVR_TRACE_FROM) && !defined(DC_PVR_TRACE)
+#define DC_PVR_TRACE (-1)
+#endif
 #ifdef DC_PVR_TRACE
+#ifdef DC_PVR_TRACE_FROM
+static unsigned s_trace_left = 3;
+static unsigned s_trace_arm, s_trace_from;
+#else
 static unsigned s_trace_left = 20;
+#endif
 #define TRACE(...) do { if (s_trace_on && s_trace_left) { char tb_[160]; snprintf(tb_, sizeof tb_, __VA_ARGS__); dbgio_write_str(tb_); } } while (0)
 #else
 #define TRACE(...) do {} while (0)
@@ -85,6 +93,23 @@ static int s_rtt_scene;             /* the open scene renders into s_rtt */
 static int s_rtt_split;             /* s_rtt holds this frame's start */
 static int s_rtt_hit;               /* this frame read itself */
 static unsigned s_rtt_idle;         /* frames since one read itself */
+
+/* VRAM copies of the frame being built. The heat haze distorts the frame,
+   then scrolls it up with a copy inside the frame, and draws back a strip
+   it had copied out of the frame first. VRAM never sees the PowerVR's
+   picture, so these are done on the PowerVR: a copy inside the frame draws
+   s_rtt's part of the source where it goes, then what was drawn since s_rtt
+   was finished, moved and clipped the same way; a copy out of the frame
+   leaves a note (s_alias) and prims that sample it read s_rtt instead. */
+#define NREC 512
+typedef struct { DcPrim p; int16_t atx, aty; uint8_t rtt; } RecPrim;
+static RecPrim s_rec[NREC];
+static int s_nrec;
+typedef struct { int dx, dy, w, h, sx, sy; } Alias;
+#define NALIAS 32
+static Alias s_alias[NALIAS];
+static int s_nalias;
+typedef struct { float dx, dy, cx0, cy0, cx1, cy1; } Xf;   /* screen offset and clip */
 
 /* ---- texture cache ------------------------------------------------------ */
 #define NTEX 28            /* at most; as many as fit in video memory */
@@ -582,8 +607,18 @@ static void scene_open_ex(int ox, int oy, int cleared)
     pvr_list_begin(PVR_LIST_TR_POLY);
     s_scene = 1; s_hdr_key = ~0u; s_frame++; g_dc_pvr_frame = s_frame; s_prims = 0; s_vblanks_open = 0;
     s_ox = ox; s_oy = oy;
+    s_nrec = 0; s_nalias = 0;
 #ifdef DC_PVR_TRACE
+#ifdef DC_PVR_TRACE_FROM
+    { static unsigned soft0; unsigned soft = g_dc_pvr_stat[1] - soft0; soft0 = g_dc_pvr_stat[1];
+      if (s_trace_on) s_trace_on = 0;
+      if (s_frame % 30 == 0) { char b[80]; snprintf(b, sizeof b, "[tr %u] sum prims=%u soft=%u at %d,%d\n", s_frame, s_last_prims, soft, ox, oy); dbgio_write_str(b); }
+      if (s_trace_arm > 0 && --s_trace_arm == 0) s_trace_from = s_frame;
+      if (s_trace_from && s_frame >= s_trace_from && s_trace_left) { s_trace_on = 1; s_trace_left--;
+          char b[64]; snprintf(b, sizeof b, "[tr %u] open soft=%u last=%u\n", s_frame, soft, s_last_prims); dbgio_write_str(b); } }
+#else
     if (oy == DC_PVR_TRACE && s_trace_left) { s_trace_on = 1; s_trace_left--; }
+#endif
 #endif
     DcGpuDisplay d; dc_gpu_display(&d);
     s_sx = 640.0f / (float)(d.w > 0 ? d.w : 320);
@@ -684,6 +719,7 @@ static void scene_sync(void)
 static int overlaps(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh);
 void dc_gpu_hw_sync(int x, int y, int w, int h)
 {
+    TRACE("[tr %u] sync %d,%d %dx%d\n", s_frame, x, y, w, h);
 #ifndef DC_PVR_READBACK
     /* off by default: in Flycast the frames read back come out scrambled
        and the battle intro drops to ~4 fps; to be tried on hardware */
@@ -995,18 +1031,156 @@ static int page_near_frame(const DcPrim* p)
            tx + pw > 1024;     /* wraps around */
 }
 
+/* Sutherland-Hodgman against one edge of the clip rectangle. */
+static int clip_edge(const pvr_vertex_t* in, int n, pvr_vertex_t* out, int axis, float lim, int keep_ge)
+{
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        const pvr_vertex_t* a = &in[i];
+        const pvr_vertex_t* b = &in[(i + 1) % n];
+        float va = axis ? a->y : a->x, vb = axis ? b->y : b->x;
+        int ia = keep_ge ? va >= lim : va <= lim, ib = keep_ge ? vb >= lim : vb <= lim;
+        if (ia) out[m++] = *a;
+        if (ia != ib) {
+            float t = (lim - va) / (vb - va);
+            pvr_vertex_t c = *a;
+            c.x = a->x + (b->x - a->x) * t; c.y = a->y + (b->y - a->y) * t;
+            c.u = a->u + (b->u - a->u) * t; c.v = a->v + (b->v - a->v) * t;
+            uint32_t col = 0;
+            for (int sh = 0; sh < 32; sh += 8) {
+                int ca = (int)(a->argb >> sh & 255), cb = (int)(b->argb >> sh & 255);
+                col |= (uint32_t)((int)(ca + (cb - ca) * t + 0.5f) & 255) << sh;
+            }
+            c.argb = col;
+            out[m++] = c;
+        }
+    }
+    return m;
+}
+
+/* A primitive's vertices (strip order), clipped to xf's rectangle, moved by
+   xf's offset and sent as a strip. */
+static void emit_clipped(const pvr_vertex_t* v, int n, const Xf* xf)
+{
+    pvr_vertex_t a[12], b[12];
+    if (n == 4) { a[0] = v[0]; a[1] = v[1]; a[2] = v[3]; a[3] = v[2]; }
+    else for (int i = 0; i < n; i++) a[i] = v[i];
+    n = clip_edge(a, n, b, 0, xf->cx0, 1); if (n < 3) return;
+    n = clip_edge(b, n, a, 0, xf->cx1, 0); if (n < 3) return;
+    n = clip_edge(a, n, b, 1, xf->cy0, 1); if (n < 3) return;
+    n = clip_edge(b, n, a, 1, xf->cy1, 0); if (n < 3) return;
+    if (s_ta_n + n * 32 > TA_BUF) ta_flush();
+    pvr_vertex_t* o = (pvr_vertex_t*)(s_ta + s_ta_n);
+    int lo = 1, hi = n - 1, k = 0;
+    o[k++] = a[0];
+    while (lo <= hi) { o[k++] = a[lo++]; if (lo <= hi) o[k++] = a[hi--]; }
+    for (int i = 0; i < k; i++) {
+        o[i].flags = i == k - 1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        o[i].x += xf->dx; o[i].y += xf->dy;
+    }
+    s_ta_n += k * 32;
+}
+
+/* Send a primitive: its header and vertices. rtt: it samples s_rtt, with
+   (atx, aty) as its texture page's place in the frame. */
+static void emit_prim(const DcPrim* p, int rtt, int atx, int aty, const Xf* xf)
+{
+    pvr_ptr_t tex = 0;
+    if (rtt) send_header_ex(p, s_rtt, RTT_FMT, RTT_W, RTT_H);
+    else {
+        int done = 0;
+        if (p->tex && p->depth <= 1 && win_w(p) == 256 && win_h(p) == 256 && (p->depth ? s_npage8 : s_npage)) {
+            pvr_ptr_t pg = page4_for(p);
+            int bank = pg ? bank_for(p) : -1;
+#ifdef DC_PVR_TEXSTAT
+            if (!pg) s_pstat[3 + p->depth]++; else if (bank < 0) s_pstat[5 + p->depth]++;
+#endif
+            if (bank >= 0) {
+                send_header_ex(p, pg, p->depth ? PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(bank) | PVR_TXRFMT_TWIDDLED
+                                               : PVR_TXRFMT_PAL4BPP | PVR_TXRFMT_4BPP_PAL(bank) | PVR_TXRFMT_TWIDDLED, 256, 256);
+                done = 1;
+            }
+#ifdef DC_PVR_TEXSTAT
+            else s_pstat[2]++;
+#endif
+        }
+        if (!done) { tex = p->tex ? texture_for(p) : 0; send_header(p, tex); }
+    }
+    uint32_t a = 255;
+    if (p->semi) a = p->semi_mode == 0 ? 128 : p->semi_mode == 3 ? 64 : 255;
+    pvr_vertex_t vb[4];
+    pvr_vertex_t* o = vb;
+    float su, sv, bu = 0, bv = 0;
+    if (rtt) {
+        su = s_sx * (1.0f / RTT_W); sv = s_sy * (1.0f / RTT_H);
+        bu = (float)(atx - s_ox) * su; bv = (float)(aty - s_oy) * sv;
+    } else {
+        su = 1.0f / (float)win_w(p); sv = 1.0f / (float)win_h(p);
+    }
+    const float fox = (float)s_ox, foy = (float)s_oy;
+    for (int k = 0; k < p->n; k++, o++) {
+        const DcPrimVtx* v = &p->v[k];
+        o->flags = k == p->n - 1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        o->x = ((float)v->x - fox) * s_sx;
+        o->y = ((float)v->y - foy) * s_sy;
+        o->z = 1.0f;
+        o->u = (float)v->u * su + bu;
+        o->v = (float)v->v * sv + bv;
+        o->argb = colour(p, v, a);
+        o->oargb = 0;
+    }
+    Xf own;
+    if (!xf) {
+        /* the PowerVR draws the whole screen: a primitive reaching out of
+           its drawing area (the heat haze's tiles below a 224-line frame)
+           is cut to it */
+        int minx = p->v[0].x, maxx = minx, miny = p->v[0].y, maxy = miny;
+        for (int k = 1; k < p->n; k++) {
+            minx = p->v[k].x < minx ? p->v[k].x : minx; maxx = p->v[k].x > maxx ? p->v[k].x : maxx;
+            miny = p->v[k].y < miny ? p->v[k].y : miny; maxy = p->v[k].y > maxy ? p->v[k].y : maxy;
+        }
+        /* edges of the screen cut it anyway */
+        const int sx1 = s_ox + (int)(640.0f / s_sx + 0.5f), sy1 = s_oy + (int)(480.0f / s_sy + 0.5f);
+        if ((minx < p->clip_x0 && p->clip_x0 > s_ox) || (miny < p->clip_y0 && p->clip_y0 > s_oy) ||
+            (maxx > p->clip_x1 + 1 && p->clip_x1 + 1 < sx1) || (maxy > p->clip_y1 + 1 && p->clip_y1 + 1 < sy1)) {
+            own.dx = own.dy = 0;
+            own.cx0 = (float)(p->clip_x0 - s_ox) * s_sx; own.cx1 = (float)(p->clip_x1 + 1 - s_ox) * s_sx;
+            own.cy0 = (float)(p->clip_y0 - s_oy) * s_sy; own.cy1 = (float)(p->clip_y1 + 1 - s_oy) * s_sy;
+            xf = &own;
+        }
+    }
+    if (!xf) {
+        if (s_ta_n + p->n * 32 > TA_BUF) ta_flush();
+        memcpy(s_ta + s_ta_n, vb, (size_t)p->n * 32u); s_ta_n += p->n * 32;
+        return;
+    }
+    emit_clipped(vb, p->n, xf);
+}
+
 int dc_gpu_hw_prim(const DcPrim* p)
 {
     if (!g_dc_pvr_on) return 0;
-    int rtt = 0;
+    int rtt = 0, atx = (int)p->tp_x, aty = (int)p->tp_y;
     const int near = page_near_frame(p);
-    if (near && s_rtt && !s_soft_frames && reads_scene(p) && frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) {
+    if (s_nalias && s_rtt_split && p->tex && p->depth == 2) {
+        int tx, ty, tw, th; tex_rect(p, &tx, &ty, &tw, &th);
+        for (int i = s_nalias - 1; i >= 0; i--) {
+            const Alias* al = &s_alias[i];
+            if (tx >= al->dx && ty >= al->dy && tx + tw <= al->dx + al->w + 1 && ty + th <= al->dy + al->h + 1) {
+                rtt = 1; atx += al->sx - al->dx; aty += al->sy - al->dy; s_rtt_hit = 1; break;
+            }
+        }
+    }
+    if (!rtt && near && s_rtt && !s_soft_frames && reads_scene(p) && frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) {
         s_rtt_hit = 1;
         if (!s_rtt_want) {
             /* first time: from the next frame on, render to texture; this
                one loses the effect */
             s_rtt_want = 1; s_rtt_idle = 0;
             dc_host_log("[pvr] frame reads itself: render to texture\n");
+#ifdef DC_PVR_TRACE_FROM
+            if (!s_trace_from && !s_trace_arm) s_trace_arm = DC_PVR_TRACE_FROM;
+#endif
         }
         if (s_rtt_scene) rtt_split();
         if (!s_rtt_split) { g_dc_pvr_stat[1]++; return 1; }
@@ -1038,6 +1212,7 @@ int dc_gpu_hw_prim(const DcPrim* p)
           p->n, p->tex, p->depth, p->tp_x, p->tp_y, p->clut_x, p->clut_y, p->semi, p->semi_mode,
           p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1, p->v[0].x, p->v[0].y, p->v[0].r, p->v[0].g, p->v[0].b,
           frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1));
+    for (int k_ = 0; k_ < p->n; k_++) TRACE("    v%d %d,%d uv %d,%d c=%02x%02x%02x\n", k_, p->v[k_].x, p->v[k_].y, p->v[k_].u, p->v[k_].v, p->v[k_].r, p->v[k_].g, p->v[k_].b);
     if (s_soft_frames) { g_dc_pvr_stat[1]++; return 0; }
     if (!frame_area(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1)) { g_dc_pvr_stat[1]++; return 0; }
     g_dc_pvr_stat[0]++;
@@ -1048,50 +1223,9 @@ int dc_gpu_hw_prim(const DcPrim* p)
         dbgio_write_str(b); } }
 #endif
     if (!s_scene) scene_open_area_ex(p->clip_x0, p->clip_y0, p->clip_x1, p->clip_y1, !PVR_FEEDBACK);
-    pvr_ptr_t tex = 0;
-    if (rtt) send_header_ex(p, s_rtt, RTT_FMT, RTT_W, RTT_H);
-    else {
-        int done = 0;
-        if (p->tex && p->depth <= 1 && win_w(p) == 256 && win_h(p) == 256 && (p->depth ? s_npage8 : s_npage)) {
-            pvr_ptr_t pg = page4_for(p);
-            int bank = pg ? bank_for(p) : -1;
-#ifdef DC_PVR_TEXSTAT
-            if (!pg) s_pstat[3 + p->depth]++; else if (bank < 0) s_pstat[5 + p->depth]++;
-#endif
-            if (bank >= 0) {
-                send_header_ex(p, pg, p->depth ? PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(bank) | PVR_TXRFMT_TWIDDLED
-                                               : PVR_TXRFMT_PAL4BPP | PVR_TXRFMT_4BPP_PAL(bank) | PVR_TXRFMT_TWIDDLED, 256, 256);
-                done = 1;
-            }
-#ifdef DC_PVR_TEXSTAT
-            else s_pstat[2]++;
-#endif
-        }
-        if (!done) { tex = p->tex ? texture_for(p) : 0; send_header(p, tex); }
-    }
-    uint32_t a = 255;
-    if (p->semi) a = p->semi_mode == 0 ? 128 : p->semi_mode == 3 ? 64 : 255;
-    if (s_ta_n + p->n * 32 > TA_BUF) ta_flush();
-    pvr_vertex_t* o = (pvr_vertex_t*)(s_ta + s_ta_n);
-    s_ta_n += p->n * 32;
-    float su, sv, bu = 0, bv = 0;
-    if (rtt) {
-        su = s_sx * (1.0f / RTT_W); sv = s_sy * (1.0f / RTT_H);
-        bu = (float)((int)p->tp_x - s_ox) * su; bv = (float)((int)p->tp_y - s_oy) * sv;
-    } else {
-        su = 1.0f / (float)win_w(p); sv = 1.0f / (float)win_h(p);
-    }
-    const float fox = (float)s_ox, foy = (float)s_oy;
-    for (int k = 0; k < p->n; k++, o++) {
-        const DcPrimVtx* v = &p->v[k];
-        o->flags = k == p->n - 1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-        o->x = ((float)v->x - fox) * s_sx;
-        o->y = ((float)v->y - foy) * s_sy;
-        o->z = 1.0f;
-        o->u = (float)v->u * su + bu;
-        o->v = (float)v->v * sv + bv;
-        o->argb = colour(p, v, a);
-        o->oargb = 0;
+    emit_prim(p, rtt, atx, aty, NULL);
+    if (s_rtt_split && !s_rtt_scene && s_nrec < NREC) {
+        RecPrim* r = &s_rec[s_nrec++]; r->p = *p; r->rtt = (uint8_t)rtt; r->atx = (int16_t)atx; r->aty = (int16_t)aty;
     }
 #ifdef DC_PVR_SHADOW_ALL
     ++s_prims; return 2;
@@ -1190,6 +1324,72 @@ void dc_gpu_hw_blit(int x, int y, int w, int h, int cx0, int cy0, int cx1, int c
     /* uploads between frames (new textures, often next to the frame) do not
        start a frame of their own */
     if (s_scene) blit(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+}
+
+/* s_rtt's (sx, sy) w x h drawn at (dx, dy) of the frame. */
+static void rtt_rect(int sx, int sy, int dx, int dy, int w, int h)
+{
+    DcPrim p;
+    memset(&p, 0, sizeof p);
+    p.tex = 1; p.raw = 1;
+    s_hdr_key = ~0u;
+    send_header_ex(&p, s_rtt, RTT_FMT, RTT_W, RTT_H);
+    const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
+    pvr_vertex_t vx;
+    for (int k = 0; k < 4; k++) {
+        vx.flags = k == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        vx.x = (float)(dx + cx[k] * w - s_ox) * s_sx; vx.y = (float)(dy + cy[k] * h - s_oy) * s_sy;
+        vx.z = 1.0f;
+        vx.u = (float)(sx + cx[k] * w - s_ox) * s_sx * (1.0f / RTT_W);
+        vx.v = (float)(sy + cy[k] * h - s_oy) * s_sy * (1.0f / RTT_H);
+        vx.argb = 0xFFFFFFFFu; vx.oargb = 0;
+        ta_put(&vx, sizeof vx);
+    }
+    s_hdr_key = ~0u;
+}
+
+int dc_gpu_hw_copy(int sx, int sy, int dx, int dy, int w, int h)
+{
+    TRACE("[tr %u] copy %d,%d -> %d,%d %dx%d\n", s_frame, sx, sy, dx, dy, w, h);
+    if (!g_dc_pvr_on || s_soft_frames || !s_rtt || !s_scene) return 0;
+    DcGpuDisplay d; dc_gpu_display(&d);
+    const int fw = d.w > 0 ? d.w : 320, fh = d.h > 0 ? d.h : 240;
+    /* the source lies in the frame being built, which VRAM does not have */
+    if (sx < s_ox || sy < s_oy || sx + w > s_ox + fw || sy + h > s_oy + fh) return 0;
+    if (vram_true(sx, sy, w, h)) return 0;
+    s_rtt_hit = 1; s_rtt_idle = 0;
+    if (!s_rtt_scene && !s_rtt_split) {
+        /* first time: from the next frame on, render to texture */
+        if (!s_rtt_want) dc_host_log("[pvr] frame copied in VRAM: render to texture\n");
+        s_rtt_want = 1;
+        return 0;
+    }
+    if (s_rtt_scene) rtt_split();
+    const int inside = dx >= s_ox && dy >= s_oy && dx + w <= s_ox + fw && dy + h <= s_oy + fh;
+    if (!inside) {
+        /* out of the frame: prims textured from there read s_rtt */
+        if (s_nalias < NALIAS) { Alias* al = &s_alias[s_nalias++]; al->dx = dx; al->dy = dy; al->w = w; al->h = h; al->sx = sx; al->sy = sy; }
+        else memmove(s_alias, s_alias + 1, sizeof s_alias - sizeof s_alias[0]), s_alias[NALIAS - 1] = (Alias){dx, dy, w, h, sx, sy};
+        mark_blocks(dx, dy, w, h, 1);
+        return 1;
+    }
+    rtt_rect(sx, sy, dx, dy, w, h);
+    Xf xf;
+    xf.dx = (float)(dx - sx) * s_sx; xf.dy = (float)(dy - sy) * s_sy;
+    const int n = s_nrec;
+    for (int i = 0; i < n; i++) {
+        const RecPrim* r = &s_rec[i];
+        const DcPrim* p = &r->p;
+        int x0 = sx > p->clip_x0 ? sx : p->clip_x0, y0 = sy > p->clip_y0 ? sy : p->clip_y0;
+        int x1 = sx + w - 1 < p->clip_x1 ? sx + w - 1 : p->clip_x1, y1 = sy + h - 1 < p->clip_y1 ? sy + h - 1 : p->clip_y1;
+        if (x0 > x1 || y0 > y1) continue;
+        xf.cx0 = (float)(x0 - s_ox) * s_sx; xf.cx1 = (float)(x1 + 1 - s_ox) * s_sx;
+        xf.cy0 = (float)(y0 - s_oy) * s_sy; xf.cy1 = (float)(y1 + 1 - s_oy) * s_sy;
+        emit_prim(p, r->rtt, r->atx, r->aty, &xf);
+    }
+    s_hdr_key = ~0u;
+    mark_blocks(dx, dy, w, h, 1);
+    return 1;
 }
 
 /* ---- init --------------------------------------------------------------- */

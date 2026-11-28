@@ -30,6 +30,8 @@ void dc_gpu_hw_flip(void);                            /* display start changed *
 /* VRAM rectangle written by a copy or an upload; clip is the drawing area */
 void dc_gpu_hw_blit(int x, int y, int w, int h, int cx0, int cy0, int cx1, int cy1);
 void dc_gpu_hw_sync(int x, int y, int w, int h);   /* VRAM area about to be read: bring it up to date */
+/* VRAM -> VRAM copy whose source the host drew: 1 when the host did it */
+int  dc_gpu_hw_copy(int sx, int sy, int dx, int dy, int w, int h);
 
 /* VRAM write generations per 64x16 block, for texture caches. */
 extern uint32_t g_dc_vram_gen[32][16];

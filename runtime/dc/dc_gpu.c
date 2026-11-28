@@ -21,6 +21,7 @@ __attribute__((weak)) int dc_gpu_hw_prim(const DcPrim* p) { (void)p; return 0; }
 __attribute__((weak)) void dc_gpu_hw_fill(int x, int y, int w, int h, uint16_t c) { (void)x; (void)y; (void)w; (void)h; (void)c; }
 __attribute__((weak)) void dc_gpu_hw_flip(void) {}
 __attribute__((weak)) void dc_gpu_hw_sync(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }
+__attribute__((weak)) int dc_gpu_hw_copy(int sx, int sy, int dx, int dy, int w, int h) { (void)sx; (void)sy; (void)dx; (void)dy; (void)w; (void)h; return 0; }
 __attribute__((weak)) void dc_gpu_hw_blit(int x, int y, int w, int h, int cx0, int cy0, int cx1, int cy1)
 { (void)x; (void)y; (void)w; (void)h; (void)cx0; (void)cy0; (void)cx1; (void)cy1; }
 
@@ -497,7 +498,8 @@ static void execute(const uint32_t* w, int n)
         int ww = ((w[3] - 1) & 0x3FF) + 1, hh = (((w[3] >> 16) - 1) & 0x1FF) + 1;
 #ifdef DC_PVR_SCENELOG
 #endif
-        dc_gpu_hw_sync(sx, sy, ww, hh);     /* the source may be drawn by the PowerVR */
+        const int hw = dc_gpu_hw_copy(sx, sy, dx, dy, ww, hh);   /* done by the PowerVR */
+        if (!hw) dc_gpu_hw_sync(sx, sy, ww, hh);     /* the source may be drawn by the PowerVR */
         vram_touch(dx, dy, ww, hh);
         for (int y = 0; y < hh; y++)
             for (int x = 0; x < ww; x++) {
@@ -506,7 +508,7 @@ static void execute(const uint32_t* w, int n)
                 if (G.check_mask && (*d & 0x8000)) continue;
                 *d = c | (G.set_mask ? 0x8000 : 0);
             }
-        dc_gpu_hw_blit(dx, dy, ww, hh, G.clip_x0, G.clip_y0, G.clip_x1, G.clip_y1);
+        if (!hw) dc_gpu_hw_blit(dx, dy, ww, hh, G.clip_x0, G.clip_y0, G.clip_x1, G.clip_y1);
         return;
     }
     case 5:                                     /* CPU -> VRAM: data follows */

@@ -456,6 +456,14 @@ void dc_io_poll(void)
     tmr_poll();
     dc_spu_tick();
     if (s_dma1_due && dc_host_ticks_us() >= s_dma1_due) { s_dma1_due = 0; s_dma1_done_t = dc_host_ticks_us(); dc_ev('D', 1, 0); dma_finish(1); }
+    /* An output DMA left waiting for a decode that never comes (a movie that
+     * ended between starting a slice and sending its data) would hold the
+     * player forever: after a second the channel ends with what it has. */
+    if (s_dma1_wait && dc_host_ticks_us() - s_dma1_wait_t > 1000000u) { s_dma1_wait = 0; dc_ev('w', 1, 0); dma_finish(1); }
+#ifdef DC_LOG
+    { static int dumped; if (s_dma1_wait && !dumped && dc_host_ticks_us() - s_dma1_wait_t > 2000000u) { uint32_t dc_last_poll_pc(void); char b[96]; dumped = 1;
+        snprintf(b, sizeof b, "[stall] dma1 wait pc=%08X chcr1=%08X\n", (unsigned)dc_last_poll_pc(), (unsigned)s_dma_chcr[1]); dc_host_log(b); dc_cd_dump_recent(); } }
+#endif
 #ifdef DC_LOG
     if (s_cd_reading && (s_cd_mode & 0x40)) { uint32_t tab = rd32(0x801E8A14u), r = rd32(0x801E8A00u), w = rd32(0x801E89F8u);
       if ((tab >> 24) == 0x80 && r < 64) { static uint32_t lr = ~0u, l26 = ~0u, lw = ~0u; uint32_t st = rd32(tab + r * 32u) & 0xFFFF, s26 = rd32(tab + 26 * 32u) & 0xFFFF;
@@ -646,6 +654,8 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
         case 0: s_dma_madr[ch] = v & 0xFFFFFFu; break;
         case 4: s_dma_bcr[ch] = v; break;
         case 8: s_dma_chcr[ch] = v;
+            if (ch <= 1) dc_ev(ch ? 'c' : 'b', v, s_dma_madr[ch]);
+            if (ch == 1 && !(v & (1u << 24))) s_dma1_wait = 0;
             if (v & (1u << 24)) dma_start(ch); break;
         }
         return;
@@ -668,6 +678,7 @@ void dc_io_write(uint32_t p, uint32_t v, int size)
     if (p >= 0x1F801800u && p < 0x1F801804u) { cd_write(p & 3, (uint8_t)v); return; }
     if (p == 0x1F801810u) { DC_PHASE(DC_PH_GPU); dc_gpu_gp0(v); DC_PHASE_END(); return; }
     if (p == 0x1F801820u || p == 0x1F801824u) {
+        if (p & 4) dc_ev('K', v, s_dma1_wait);
         dc_mdec_write(p, v);
         if (s_dma1_wait) { s_dma1_wait = 0; dma_start(1); }
         return;
