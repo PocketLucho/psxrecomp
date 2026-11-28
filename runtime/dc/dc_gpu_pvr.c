@@ -1150,14 +1150,29 @@ static void emit_prim(const DcPrim* p, int rtt, int atx, int aty, const Xf* xf)
         su = 1.0f / (float)win_w(p); sv = 1.0f / (float)win_h(p);
     }
     const float fox = (float)s_ox, foy = (float)s_oy;
+    /* Filtered: the texture is the whole 256x256 page, so at a primitive's
+       edge the filter would blend in the next texel, which belongs to another
+       tile (often transparent black): dark seams between ground polygons.
+       Pull the outermost texel coordinates in by half a texel. */
+    int fu0 = 0, fu1 = -1, fv0 = 0, fv1 = -1;
+    if (s_filter && p->tex && !rtt) {
+        fu0 = fu1 = p->v[0].u; fv0 = fv1 = p->v[0].v;
+        for (int k = 1; k < p->n; k++) {
+            fu0 = p->v[k].u < fu0 ? p->v[k].u : fu0; fu1 = p->v[k].u > fu1 ? p->v[k].u : fu1;
+            fv0 = p->v[k].v < fv0 ? p->v[k].v : fv0; fv1 = p->v[k].v > fv1 ? p->v[k].v : fv1;
+        }
+    }
     for (int k = 0; k < p->n; k++, o++) {
         const DcPrimVtx* v = &p->v[k];
         o->flags = k == p->n - 1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
         o->x = ((float)v->x - fox) * s_sx;
         o->y = ((float)v->y - foy) * s_sy;
         o->z = 1.0f;
-        o->u = (float)v->u * su + bu;
-        o->v = (float)v->v * sv + bv;
+        float tu = (float)v->u, tv = (float)v->v;
+        if (fu1 - fu0 >= 2) tu += v->u == fu0 ? 0.5f : v->u == fu1 ? -0.5f : 0.0f;
+        if (fv1 - fv0 >= 2) tv += v->v == fv0 ? 0.5f : v->v == fv1 ? -0.5f : 0.0f;
+        o->u = tu * su + bu;
+        o->v = tv * sv + bv;
         o->argb = colour(p, v, a);
         o->oargb = 0;
     }
