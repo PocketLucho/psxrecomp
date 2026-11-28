@@ -69,6 +69,10 @@ static unsigned s_trace_left = 20;
 #endif
 
 static uint32_t s_hdr_key = ~0u;
+/* Bilinear filtering for 3D polygons (DC_PVR_NO_FILTER: off). Sprites,
+   text and anything drawn texel for pixel stay sharp, as do primitives
+   sampling the frame itself. */
+static int s_filter;
 static unsigned s_prims, s_vblanks_open;
 static int s_bg;
 unsigned g_dc_pvr_stat[4];
@@ -684,6 +688,7 @@ static void rtt_split(void)
 static void rtt_quad(void) { rtt_quad_of(s_rtt); }
 static void rtt_quad_of(pvr_ptr_t t)
 {
+    s_filter = 0;
     DcPrim p;
     memset(&p, 0, sizeof p);
     p.tex = 1; p.raw = 1;
@@ -752,6 +757,7 @@ static void hud_draw(void)
     }
     DcPrim p; memset(&p, 0, sizeof p);
     p.n = 4; p.tex = 1; p.raw = 1; p.depth = 3;
+    s_filter = 0;
     send_header_ex(&p, tex, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, 512, 64);
     const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
     pvr_vertex_t vx;
@@ -871,7 +877,11 @@ static void show_depth24(const DcGpuDisplay* d)
     scene_open_ex(d->x, d->y, 1);
     DcPrim p; memset(&p, 0, sizeof p);
     p.n = 4; p.tex = 1; p.raw = 1; p.depth = 3;
+#ifndef DC_PVR_NO_FILTER
+    s_filter = 1;        /* movies are shown at twice their size: smoothed */
+#endif
     send_header_ex(&p, s_tex24, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, 512, 256);
+    s_filter = 0;
     const int cx[4] = {0, 1, 0, 1}, cy[4] = {0, 0, 1, 1};
     pvr_vertex_t vx;
     for (int k = 0; k < 4; k++) {
@@ -932,13 +942,13 @@ static void send_header(const DcPrim* p, pvr_ptr_t tex)
 }
 static void send_header_ex(const DcPrim* p, pvr_ptr_t tex, uint32_t fmt, int tw, int th)
 {
-    uint32_t key = (uint32_t)(uintptr_t)tex ^ (uint32_t)(p->tex << 1 | p->semi << 2 | p->semi_mode << 3 | p->gouraud << 5) ^
+    uint32_t key = (uint32_t)(uintptr_t)tex ^ (uint32_t)(p->tex << 1 | p->semi << 2 | p->semi_mode << 3 | p->gouraud << 5 | s_filter << 14) ^
                    (uint32_t)(__builtin_ctz(tw) << 6 | __builtin_ctz(th) << 10) ^ (fmt >> 16) * 0x9E37u;
     if (key == s_hdr_key) return;
     s_hdr_key = key;
     pvr_poly_cxt_t c;
     if (p->tex) {
-        pvr_poly_cxt_txr(&c, PVR_LIST_TR_POLY, fmt, tw, th, tex, PVR_FILTER_NONE);
+        pvr_poly_cxt_txr(&c, PVR_LIST_TR_POLY, fmt, tw, th, tex, s_filter ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
         c.txr.env = PVR_TXRENV_MODULATEALPHA;
     } else {
         pvr_poly_cxt_col(&c, PVR_LIST_TR_POLY);
@@ -1085,6 +1095,20 @@ static void emit_clipped(const pvr_vertex_t* v, int n, const Xf* xf)
    (atx, aty) as its texture page's place in the frame. */
 static void emit_prim(const DcPrim* p, int rtt, int atx, int aty, const Xf* xf)
 {
+    s_filter = 0;
+#ifndef DC_PVR_NO_FILTER
+    if (p->tex && !rtt) {
+        /* texel for pixel: an upright quad as wide and tall as its texels */
+        int flat = p->n == 4;
+        if (flat) {
+            const DcPrimVtx* v = p->v;
+            int dx = v[1].x - v[0].x, dy = v[2].y - v[0].y, du = v[1].u - v[0].u, dv = v[2].v - v[0].v;
+            flat = v[1].y == v[0].y && v[2].x == v[0].x && v[3].x == v[1].x && v[3].y == v[2].y &&
+                   (dx == du || dx == -du) && (dy == dv || dy == -dv);
+        }
+        s_filter = !flat;
+    }
+#endif
     pvr_ptr_t tex = 0;
     if (rtt) send_header_ex(p, s_rtt, RTT_FMT, RTT_W, RTT_H);
     else {
@@ -1286,6 +1310,7 @@ void dc_gpu_hw_fill(int x, int y, int w, int h, uint16_t c)
 /* Draw a VRAM rectangle as opaque textured quads, 256x256 at a time. */
 static void blit(int x, int y, int w, int h)
 {
+    s_filter = 0;
     DcPrim p;
     memset(&p, 0, sizeof p);
     p.n = 4; p.tex = 1; p.raw = 1; p.depth = 3;
@@ -1329,6 +1354,7 @@ void dc_gpu_hw_blit(int x, int y, int w, int h, int cx0, int cy0, int cx1, int c
 /* s_rtt's (sx, sy) w x h drawn at (dx, dy) of the frame. */
 static void rtt_rect(int sx, int sy, int dx, int dy, int w, int h)
 {
+    s_filter = 0;
     DcPrim p;
     memset(&p, 0, sizeof p);
     p.tex = 1; p.raw = 1;
