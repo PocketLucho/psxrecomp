@@ -3157,10 +3157,17 @@ GeneratedFunction CodeGenerator::generate_function(
     // Register every leader (the jal/jalr call-returns pushed during translation
     // above are a subset, deduped by `seen`/the owner map). Entry block runs from
     // the top (cpu->pc==0) and is dispatched as a function entry, so skip it.
-    if (cps_enabled_) {
+    if (cps_enabled_ && config_.continuations_all_leaders) {
         for (uint32_t block_addr : cfg.block_order) {
             if (block_addr == func.start_addr) continue;
             cps_cur_continuations_.push_back(block_addr);
+        }
+    } else if (cps_enabled_) {
+        // Call returns of a jal/jalr that sits in another piece (the piece
+        // starts at its delay slot) are only reachable as continuations.
+        for (uint32_t block_addr : cfg.block_order) {
+            if (block_addr == func.start_addr || block_addr - 8u >= func.start_addr) continue;
+            if (is_link_transfer_at(block_addr - 8u)) cps_cur_continuations_.push_back(block_addr);
         }
     }
 
@@ -3220,24 +3227,26 @@ GeneratedFunction CodeGenerator::generate_function(
         // the snapshot held rather than the ones live at the real resume
         // point -- which could cascade into a wild jump a few iterations
         // later. Every other PC class is unaffected; this is purely additive. */
-        body_ss << config_.indent << "{\n";
-        body_ss << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
-        body_ss << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
-        body_ss << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
-        body_ss << config_.indent << "        g_psx_resume_seed = 0;\n";
-        body_ss << config_.indent << "        switch (_rcont) {\n";
-        {
-            std::set<uint32_t> seen_resume;
-            for (uint32_t c : cps_cur_continuations_) {
-                if (!seen_resume.insert(c).second) continue;
-                body_ss << config_.indent
-                        << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+        if (config_.emit_resume_seed_switch) {
+            body_ss << config_.indent << "{\n";
+            body_ss << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
+            body_ss << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
+            body_ss << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
+            body_ss << config_.indent << "        g_psx_resume_seed = 0;\n";
+            body_ss << config_.indent << "        switch (_rcont) {\n";
+            {
+                std::set<uint32_t> seen_resume;
+                for (uint32_t c : cps_cur_continuations_) {
+                    if (!seen_resume.insert(c).second) continue;
+                    body_ss << config_.indent
+                            << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+                }
             }
+            body_ss << config_.indent << "            default: break;\n";
+            body_ss << config_.indent << "        }\n";
+            body_ss << config_.indent << "    }\n";
+            body_ss << config_.indent << "}\n";
         }
-        body_ss << config_.indent << "            default: break;\n";
-        body_ss << config_.indent << "        }\n";
-        body_ss << config_.indent << "    }\n";
-        body_ss << config_.indent << "}\n";
         body_ss << config_.indent << "if (cpu->pc != 0u) {\n";
         body_ss << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
         body_ss << config_.indent << "    switch (_cont) {\n";
@@ -3568,7 +3577,14 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // an entry switch; the leaders re-enter via the continuation switch below.
     // Owner = aliases[0]->start_addr (same as the call-return continuations). Skip
     // the alias entry PCs (they are dispatched as function entries with cpu->pc==0).
-    if (cps_enabled_) {
+    if (cps_enabled_ && !config_.continuations_all_leaders) {
+        for (uint32_t block_addr : cfg.block_order) {
+            if (!live_blocks.count(block_addr)) continue;
+            if (block_addr - 8u >= cfg.function_start) continue;
+            if (is_link_transfer_at(block_addr - 8u)) cps_cur_continuations_.push_back(block_addr);
+        }
+    }
+    if (cps_enabled_ && config_.continuations_all_leaders) {
         std::set<uint32_t> alias_entries;
         for (const Function* a : aliases) alias_entries.insert(a->start_addr);
         for (uint32_t block_addr : cfg.block_order) {
@@ -3597,24 +3613,26 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         // mid-function label was silently defeated by the trampoline's
         // unconditional cpu->pc zeroing; this is a separate, always-safe
         // channel the trampoline and an ordinary return never touch).
-        body << config_.indent << "{\n";
-        body << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
-        body << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
-        body << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
-        body << config_.indent << "        g_psx_resume_seed = 0;\n";
-        body << config_.indent << "        switch (_rcont) {\n";
-        {
-            std::set<uint32_t> seen_resume;
-            for (uint32_t c : cps_cur_continuations_) {
-                if (!seen_resume.insert(c).second) continue;
-                body << config_.indent
-                     << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+        if (config_.emit_resume_seed_switch) {
+            body << config_.indent << "{\n";
+            body << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
+            body << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
+            body << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
+            body << config_.indent << "        g_psx_resume_seed = 0;\n";
+            body << config_.indent << "        switch (_rcont) {\n";
+            {
+                std::set<uint32_t> seen_resume;
+                for (uint32_t c : cps_cur_continuations_) {
+                    if (!seen_resume.insert(c).second) continue;
+                    body << config_.indent
+                         << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+                }
             }
+            body << config_.indent << "            default: break;\n";
+            body << config_.indent << "        }\n";
+            body << config_.indent << "    }\n";
+            body << config_.indent << "}\n";
         }
-        body << config_.indent << "            default: break;\n";
-        body << config_.indent << "        }\n";
-        body << config_.indent << "    }\n";
-        body << config_.indent << "}\n";
         body << config_.indent << "if (cpu->pc != 0u) {\n";
         body << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
         body << config_.indent << "    switch (_cont) {\n";
@@ -4122,8 +4140,15 @@ std::string CodeGenerator::generate_file(
         for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
 
+            std::set<uint32_t> data_starts;
+            for (const auto& f : functions_mut)
+                if (f.is_data_section) data_starts.insert(f.start_addr);
+
             // Scan either all CFGs (pass 0) or only rebuilt CFGs (pass 1+)
             auto scan_cfg = [&](const ControlFlowGraph& cfg) {
+                // A data section is emitted as a dispatch stub; its decoded
+                // "branches" are data words and must not mint entry points.
+                if (config_.split_skip_data_sources && data_starts.count(cfg.function_start)) return;
                 for (const auto& [baddr, block] : cfg.blocks) {
                     auto check_target = [&](uint32_t target) {
                         if (target == 0) return;
@@ -4413,6 +4438,13 @@ std::string CodeGenerator::generate_ranges_manifest(
             ss << fmt::format("R {:08X} {:X}\n", r.first, r.second - r.first);
     }
     return ss.str();
+}
+
+bool CodeGenerator::is_link_transfer_at(uint32_t addr) const {
+    auto w = exe_.read_word(addr);
+    if (!w) return false;
+    const uint32_t op = *w >> 26, rt = (*w >> 16) & 0x1Fu, funct = *w & 0x3Fu;
+    return op == 3u || (op == 0u && funct == 9u) || (op == 1u && (rt == 0x10u || rt == 0x11u));
 }
 
 } // namespace PSXRecomp

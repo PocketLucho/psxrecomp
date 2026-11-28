@@ -540,6 +540,14 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
             }
         }
     }
+    // A piece that starts at the delay slot of a transfer just before it (an
+    // annotated mid-function entry right after a jal) still owns that
+    // transfer's return/fall-through PC: make it a leader so CPS can resume
+    // there. Field 0x80070D18 starts at the slot of the jal at 0x80070D14.
+    for (uint32_t addr = walk_lo >= 8 ? walk_lo - 8 : 0; addr < walk_lo; addr += 4) {
+        auto instr_opt = exe_.read_word(addr);
+        if (instr_opt && is_control_flow(*instr_opt)) add_boundary(addr + 8);
+    }
     // Build blocks from boundaries
     std::set<uint32_t> boundaries(boundary_vec.begin(), boundary_vec.end());
     /* The BIOS interrupt handler advances EPC by four when the interrupted

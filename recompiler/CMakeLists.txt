@@ -91,6 +91,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/config_loader.cpp
     src/recompiler_patch.cpp
     src/source_observation_plan.cpp
+    src/dc_target.cpp
     src/main_psx.cpp
 )
 
@@ -444,6 +445,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/config_loader.cpp
     src/recompiler_patch.cpp
     src/source_observation_plan.cpp
+    src/dc_target.cpp
     src/main_psx.cpp
 )
 
